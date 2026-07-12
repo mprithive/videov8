@@ -213,6 +213,15 @@ class VideoV8Multithreaded {
 				`(AI every ${effectiveInferenceStride} processed frames, render stride ${renderStride}, target ${targetInferenceFrames})`
 			);
 
+			// When every frame is rendered (renderStride === 1) each output frame is
+			// fully self-contained — no cross-frame landmark/bitmap blending — so the
+			// entire AI + compositing pipeline can run inside the workers in parallel.
+			// The main thread is then reduced to decode → transfer → encode. For
+			// renderStride > 1 we keep the legacy main-thread compositor because
+			// interpolation needs neighbouring keyframes that live in other batches.
+			const DRAW_IN_WORKER = renderStride === 1;
+			console.log(`Draw-in-worker pipeline: ${DRAW_IN_WORKER ? 'ON (parallel AI + drawing)' : 'OFF (main-thread compositing)'}`);
+
 			// Initialize output encoder
 			const output = new Output({
 				format: new Mp4OutputFormat(),
@@ -332,9 +341,28 @@ class VideoV8Multithreaded {
 
 			const scheduleEncode = () => {
 				encodeChain = encodeChain.then(async () => {
-					while (encodedFrameMap.has(nextFrameToEncode) && nextFrameToEncode < totalFrames) {
+					while (encodedFrameMap.has(nextFrameToEncode) && (DRAW_IN_WORKER || nextFrameToEncode < totalFrames)) {
 						const frameData = encodedFrameMap.get(nextFrameToEncode);
 						encodedFrameMap.delete(nextFrameToEncode);
+
+						// Draw-in-worker mode: the worker already composited the full frame.
+						// The main thread just blits it onto the encode canvas, in order.
+						if (frameData.rendered) {
+							encodeCtx.clearRect(0, 0, this.width, this.height);
+							encodeCtx.drawImage(frameData.rendered, 0, 0, this.width, this.height);
+							frameData.rendered.close();
+							await videoSource.add(nextFrameToEncode * frameDuration, frameDuration);
+							nextFrameToEncode++;
+							if (onProgress) {
+								onProgress({
+									current: nextFrameToEncode,
+									total: totalFrames,
+									progress: (totalDecoded + nextFrameToEncode) / (totalFrames * 2),
+								});
+							}
+							continue;
+						}
+
 						encodeCtx.clearRect(0, 0, this.width, this.height);
 						encodeCtx.drawImage(frameData.bitmapRef.bitmap, 0, 0, this.width, this.height);
 						frameData.bitmapRef.remainingUses--;
@@ -395,9 +423,11 @@ class VideoV8Multithreaded {
 					}
 				};
 				worker.addEventListener('message', handler);
-				const transferables = frames.map(f => f.detectBitmap).filter(Boolean);
+				const transferables = DRAW_IN_WORKER
+					? frames.map(f => f.fullBitmap).filter(Boolean)
+					: frames.map(f => f.detectBitmap).filter(Boolean);
 				worker.postMessage(
-					{ type: 'PROCESS_BATCH', payload: { frames, width: this.width, height: this.height, inferenceStride: effectiveInferenceStride } },
+					{ type: 'PROCESS_BATCH', payload: { frames, width: this.width, height: this.height, inferenceStride: effectiveInferenceStride, drawInWorker: DRAW_IN_WORKER } },
 					transferables
 				);
 			});
@@ -461,22 +491,34 @@ class VideoV8Multithreaded {
 						sample.draw(decodeCtx, 0, 0);
 						sample.close();
 
-						detectCtx.clearRect(0, 0, detectCanvas.width, detectCanvas.height);
-						detectCtx.drawImage(decodeCanvas, 0, 0, detectCanvas.width, detectCanvas.height);
+						if (DRAW_IN_WORKER) {
+							// One bitmap per frame; the worker downscales it for inference
+							// itself and composites the effect, so the main thread avoids
+							// the extra detect-canvas draw + second createImageBitmap.
+							decodedFrames.push({
+								frameIndex: fi,
+								fullBitmap: await createImageBitmap(decodeCanvas),
+								timestamp: Math.round((startTime + fi * frameInterval) * 1000),
+							});
+						} else {
+							detectCtx.clearRect(0, 0, detectCanvas.width, detectCanvas.height);
+							detectCtx.drawImage(decodeCanvas, 0, 0, detectCanvas.width, detectCanvas.height);
 
-						const bitmapRef = {
-							bitmap: await createImageBitmap(decodeCanvas),
-							remainingUses: 0,
-						};
+							const bitmapRef = {
+								bitmap: await createImageBitmap(decodeCanvas),
+								remainingUses: 0,
+							};
 
-						decodedFrames.push({
-							frameIndex: fi,
-							detectBitmap: await createImageBitmap(detectCanvas),
-							timestamp: Math.round((startTime + fi * frameInterval) * 1000),
-						});
+							decodedFrames.push({
+								frameIndex: fi,
+								detectBitmap: await createImageBitmap(detectCanvas),
+								timestamp: Math.round((startTime + fi * frameInterval) * 1000),
+							});
+
+							bitmapRefs.set(fi, bitmapRef);
+						}
 
 						coverageBySource.set(fi, []);
-						bitmapRefs.set(fi, bitmapRef);
 						currentSourceFrameIndex = fi;
 						totalDecoded++;
 					}
@@ -521,6 +563,16 @@ class VideoV8Multithreaded {
 
 				await Promise.all(workerPumps);
 
+				if (DRAW_IN_WORKER) {
+					// Workers already produced finished frames (1:1 with output frames
+					// because renderStride === 1). Queue them straight for in-order encode.
+					for (const [frameIndex, result] of sourceFrameResults) {
+						encodedFrameMap.set(frameIndex, { rendered: result.rendered });
+					}
+					scheduleEncode();
+					return;
+				}
+
 				const sourceFrameIndexes = Array.from(chunkFrames.coverageBySource.keys()).sort((a, b) => a - b);
 				for (let sourceIndex = 0; sourceIndex < sourceFrameIndexes.length; sourceIndex++) {
 					const sourceFrameIndex = sourceFrameIndexes[sourceIndex];
@@ -555,21 +607,89 @@ class VideoV8Multithreaded {
 				scheduleEncode();
 			};
 
-			for (let chunkStart = 0; chunkStart < totalFrames; chunkStart += CHUNK_FRAME_COUNT) {
-				const t0 = performance.now();
-				const chunkEnd = Math.min(chunkStart + CHUNK_FRAME_COUNT, totalFrames);
-				const decodedChunk = await decodeRange(chunkStart, chunkEnd);
+			if (DRAW_IN_WORKER) {
+				// ── Sequential-decode + pipelined pump (fast path, renderStride === 1) ──
+				// Decode via the sink's sequential iterator, which decodes each packet
+				// AT MOST ONCE. getSample() (used by the legacy path) instead re-seeks to
+				// the nearest keyframe for every frame and redundantly re-decodes whole
+				// GOPs — the main reason 4K was slow. We also decode chunk N+1 on the main
+				// thread while the workers process chunk N, and apply back-pressure so
+				// finished 4K frames don't pile up faster than the encoder drains them.
+				const iterEnd = (endTime && endTime < this.duration) ? endTime : undefined;
+				const sampleIterator = this.sink.samples(startTime, iterEnd);
+				let iteratorDone = false;
+				let decodedOutputIndex = 0;
 
-				await processChunk(decodedChunk);
+				const decodeNextChunk = async () => {
+					const decodedFrames = [];
+					for (let n = 0; n < CHUNK_FRAME_COUNT; n++) {
+						const { value: sample, done } = await sampleIterator.next();
+						if (done || !sample) { iteratorDone = true; break; }
+						decodeCtx.clearRect(0, 0, this.width, this.height);
+						sample.draw(decodeCtx, 0, 0);
+						sample.close();
+						const fi = decodedOutputIndex++;
+						decodedFrames.push({
+							frameIndex: fi,
+							fullBitmap: await createImageBitmap(decodeCanvas),
+							timestamp: Math.round((startTime + fi * frameInterval) * 1000),
+						});
+						totalDecoded++;
+						if (onProgress) {
+							onProgress({
+								current: totalDecoded,
+								total: totalFrames,
+								progress: Math.min(1, (totalDecoded + nextFrameToEncode) / (totalFrames * 2)),
+							});
+						}
+					}
+					return { decodedFrames, coverageBySource: new Map(), bitmapRefs: new Map() };
+				};
 
-				const chunkMs = Math.round(performance.now() - t0);
-				console.log(
-					`Chunk ${Math.floor(chunkStart / CHUNK_FRAME_COUNT) + 1}: ` +
-					`frames ${chunkStart}–${chunkEnd - 1} | ` +
-					`${decodedChunk.decodedFrames.length} decoded keyframes | ` +
-					`worker-batch ${WORKER_BATCH_SIZE} | ` +
-					`time ${chunkMs}ms | pending-encode: ${encodedFrameMap.size}`
-				);
+				// Cap on finished-but-not-yet-encoded frames held in memory (~one chunk).
+				const MAX_PENDING_ENCODE = Math.max(CHUNK_FRAME_COUNT, this.workers.length * WORKER_BATCH_SIZE * 2);
+				let decodePromise = decodeNextChunk();
+				let chunkNo = 0;
+
+				while (true) {
+					const t0 = performance.now();
+					const decodedChunk = await decodePromise;
+					if (decodedChunk.decodedFrames.length === 0) break;
+
+					// Kick off the next chunk's decode NOW so it overlaps worker processing.
+					decodePromise = iteratorDone ? Promise.resolve({ decodedFrames: [] }) : decodeNextChunk();
+
+					await processChunk(decodedChunk);
+
+					// Back-pressure: if encoding lags behind, let it drain before racing ahead.
+					if (encodedFrameMap.size > MAX_PENDING_ENCODE) {
+						await encodeChain;
+					}
+
+					const chunkMs = Math.round(performance.now() - t0);
+					console.log(
+						`Chunk ${++chunkNo}: ${decodedChunk.decodedFrames.length} frames | ` +
+						`worker-batch ${WORKER_BATCH_SIZE} | time ${chunkMs}ms | ` +
+						`pending-encode: ${encodedFrameMap.size}`
+					);
+				}
+			} else {
+				for (let chunkStart = 0; chunkStart < totalFrames; chunkStart += CHUNK_FRAME_COUNT) {
+					const t0 = performance.now();
+					const chunkEnd = Math.min(chunkStart + CHUNK_FRAME_COUNT, totalFrames);
+					const decodedChunk = await decodeRange(chunkStart, chunkEnd);
+
+					await processChunk(decodedChunk);
+
+					const chunkMs = Math.round(performance.now() - t0);
+					console.log(
+						`Chunk ${Math.floor(chunkStart / CHUNK_FRAME_COUNT) + 1}: ` +
+						`frames ${chunkStart}–${chunkEnd - 1} | ` +
+						`${decodedChunk.decodedFrames.length} decoded keyframes | ` +
+						`worker-batch ${WORKER_BATCH_SIZE} | ` +
+						`time ${chunkMs}ms | pending-encode: ${encodedFrameMap.size}`
+					);
+				}
 			}
 
 			// All rounds dispatched — wait for the encode chain to fully drain.

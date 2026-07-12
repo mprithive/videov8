@@ -11,7 +11,11 @@ const WORKER_COUNT = Math.min(navigator.hardwareConcurrency || 4, 8);
 const TARGET_AI_INFERENCE_FRAMES = 160;
 const APPROX_DEVICE_MEMORY_GB = navigator.deviceMemory || 8;
 const MEMORY_BUDGET_FRACTION = 0.4;
-const RENDER_FRAME_STRIDE = 3;
+// renderStride = 1 renders every frame (no frames skipped / interpolated) and
+// unlocks the draw-in-worker pipeline: each worker does AI inference AND effect
+// compositing in parallel, so the main thread only decodes and encodes.
+// Increase (e.g. 3) to trade quality for speed via keyframe interpolation.
+const RENDER_FRAME_STRIDE = 1;
 
 function Home() {
   const [videoFile, setVideoFile] = useState(null);
