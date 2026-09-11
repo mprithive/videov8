@@ -2,6 +2,7 @@ import React, { useState, useRef } from 'react';
 import './home.css';
 import VideoV8 from '../lib/videoV8';
 import VideoV8Multithreaded from '../lib/videoV8_multithreaded';
+import { applyPatternFill, createSegmentationAux, loadPatternBitmaps, pickPatternIndex, SELFIE_SEGMENTER_MODEL } from '../lib/segmentationEffect';
 
 // ── Worker count ─────────────────────────────────────────────────────────────
 // Change this number to experiment. Each worker loads its own FaceLandmarker
@@ -16,6 +17,23 @@ const MEMORY_BUDGET_FRACTION = 0.4;
 // compositing in parallel, so the main thread only decodes and encodes.
 // Increase (e.g. 3) to trade quality for speed via keyframe interpolation.
 const RENDER_FRAME_STRIDE = 1;
+const AI_EFFECT_FACEMESH = 'facemesh';
+const AI_EFFECT_SEGMENTATION = 'segmentation';
+
+function createPipelineState(workerCount) {
+  return {
+    workers: Array.from({ length: workerCount }, (_, id) => ({
+      id,
+      status: 'idle',
+      pending: 0,
+      lastFrom: null,
+      lastTo: null,
+      processed: 0,
+    })),
+    decoder: { active: false, decoded: 0 },
+    encoder: { active: false, frame: 0, encoded: 0 },
+  };
+}
 
 function Home() {
   const [videoFile, setVideoFile] = useState(null);
@@ -30,10 +48,83 @@ function Home() {
   const [currentFrameIndex, setCurrentFrameIndex] = useState(0);
   const [processingStatus, setProcessingStatus] = useState('');
   const [useMultithreaded, setUseMultithreaded] = useState(false);
+  const [aiEffect, setAiEffect] = useState(AI_EFFECT_FACEMESH);
   const [exportStartTime, setExportStartTime] = useState(null);
   const [elapsedTime, setElapsedTime] = useState(0);
+  const [showBts, setShowBts] = useState(false);
+  const [pipelineView, setPipelineView] = useState(() => createPipelineState(WORKER_COUNT));
   const fileInputRef = useRef(null);
   const playerRef = useRef(null);
+  const pipelineRef = useRef(createPipelineState(WORKER_COUNT));
+  const pipelineFlushRef = useRef(false);
+
+  const flushPipelineView = () => {
+    if (pipelineFlushRef.current) return;
+    pipelineFlushRef.current = true;
+    requestAnimationFrame(() => {
+      pipelineFlushRef.current = false;
+      const next = pipelineRef.current;
+      setPipelineView({
+        decoder: { ...next.decoder },
+        encoder: { ...next.encoder },
+        workers: next.workers.map((worker) => ({ ...worker })),
+      });
+    });
+  };
+
+  const handlePipelineEvent = (event) => {
+    const state = pipelineRef.current;
+    const worker = event.workerIndex != null ? state.workers[event.workerIndex] : null;
+
+    switch (event.type) {
+      case 'pipeline-ready':
+        pipelineRef.current = createPipelineState(event.workerCount || WORKER_COUNT);
+        break;
+      case 'decoder-start':
+        state.decoder.active = true;
+        break;
+      case 'decoder-idle':
+        state.decoder.active = false;
+        if (event.decoded != null) state.decoder.decoded = event.decoded;
+        break;
+      case 'worker-receive':
+        if (worker) {
+          worker.status = 'processing';
+          worker.pending += event.frameCount || 0;
+          worker.lastFrom = event.from;
+          worker.lastTo = event.to;
+        }
+        break;
+      case 'worker-processed':
+        if (worker) {
+          worker.status = worker.pending > 0 ? 'handoff' : 'idle';
+          worker.processed += event.frameCount || 0;
+          worker.lastFrom = event.from;
+          worker.lastTo = event.to;
+        }
+        break;
+      case 'encoder-start':
+        state.encoder.active = true;
+        state.encoder.frame = event.frameIndex ?? state.encoder.frame;
+        break;
+      case 'encoder-frame':
+        state.encoder.active = true;
+        state.encoder.frame = event.frameIndex ?? state.encoder.frame;
+        state.encoder.encoded += 1;
+        if (worker && worker.pending > 0) {
+          worker.pending -= 1;
+          if (worker.pending === 0) worker.status = 'idle';
+        }
+        break;
+      case 'encoder-idle':
+        state.encoder.active = false;
+        break;
+      default:
+        break;
+    }
+
+    flushPipelineView();
+  };
 
   // Sample render function that draws circles on frames
   const sampleRenderFunction = async (ctx, frameIndex, time, frameInfo) => {
@@ -197,6 +288,72 @@ function Home() {
     }
   };
 
+  // AI-powered pattern fill: selfie mask + random src/Patterns image every 0.5s
+  const aiSegmentationRenderFunction = async (ctx, frameIndex, time, frameInfo) => {
+    const { width, height } = frameInfo;
+
+    try {
+      if (!window.imageSegmenterInstance) {
+        const { ImageSegmenter, FilesetResolver } = await import('@mediapipe/tasks-vision');
+        const wasmBasePath = `${window.location.origin}${process.env.PUBLIC_URL || ''}/mediapipe-wasm`;
+        const filesetResolver = await FilesetResolver.forVisionTasks(wasmBasePath);
+        window.imageSegmenterInstance = await ImageSegmenter.createFromOptions(filesetResolver, {
+          baseOptions: {
+            modelAssetPath: SELFIE_SEGMENTER_MODEL,
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          outputCategoryMask: true,
+          outputConfidenceMasks: false,
+        });
+        window.segmentationAux = createSegmentationAux();
+        window.patternBitmaps = await loadPatternBitmaps();
+        window.segmentationDetectCanvas = document.createElement('canvas');
+        window.segmentationDetectCanvas.width = 256;
+        window.segmentationDetectCanvas.height = Math.max(1, Math.round(256 * height / width));
+        window.segmentationDetectCtx = window.segmentationDetectCanvas.getContext('2d');
+      }
+
+      const detectCtx = window.segmentationDetectCtx;
+      detectCtx.clearRect(0, 0, detectCtx.canvas.width, detectCtx.canvas.height);
+      detectCtx.drawImage(ctx.canvas, 0, 0, detectCtx.canvas.width, detectCtx.canvas.height);
+
+      const timestampMs = Math.round(time * 1000);
+      let copiedMask = null;
+      window.imageSegmenterInstance.segmentForVideo(detectCtx.canvas, timestampMs, (result) => {
+        if (!result || !result.categoryMask) return;
+        const src = result.categoryMask.getAsUint8Array();
+        const data = new Uint8Array(src.length);
+        data.set(src);
+        copiedMask = {
+          width: result.categoryMask.width,
+          height: result.categoryMask.height,
+          getAsUint8Array: () => data,
+        };
+      });
+
+      const patterns = window.patternBitmaps || [];
+      const pattern = patterns.length > 0
+        ? patterns[pickPatternIndex(timestampMs, patterns.length)]
+        : null;
+      const frameBitmap = await createImageBitmap(ctx.canvas);
+      applyPatternFill(ctx, frameBitmap, copiedMask, window.segmentationAux, pattern, width, height);
+      frameBitmap.close();
+
+      ctx.font = 'bold 14px Arial';
+      ctx.shadowColor = 'rgba(0,0,0,0.7)';
+      ctx.shadowBlur = 4;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(`Frame: ${frameIndex} | Pattern`, 10, 30);
+      ctx.shadowColor = 'transparent';
+    } catch (error) {
+      console.error('Error in segmentation pattern render:', error);
+      ctx.fillStyle = '#ff6666';
+      ctx.font = 'bold 14px Arial';
+      ctx.fillText('Error processing segmentation', 10, 30);
+    }
+  };
+
   // Handle file upload
   const handleUpload = async (event) => {
     const file = event.target.files[0];
@@ -225,6 +382,7 @@ function Home() {
             workerCount: WORKER_COUNT,
             approxDeviceMemoryGB: APPROX_DEVICE_MEMORY_GB,
             memoryBudgetFraction: MEMORY_BUDGET_FRACTION,
+            aiEffect,
           })
         : new VideoV8();
 
@@ -289,6 +447,7 @@ function Home() {
               workerCount: WORKER_COUNT,
               approxDeviceMemoryGB: APPROX_DEVICE_MEMORY_GB,
               memoryBudgetFraction: MEMORY_BUDGET_FRACTION,
+              aiEffect,
             })
           : new VideoV8();
 
@@ -312,6 +471,10 @@ function Home() {
       const totalFrameCount = Math.ceil(duration * frameRate);
       setTotalFrames(totalFrameCount);
       setCurrentFrameIndex(0);
+      const workerSlots = useMultithreaded ? WORKER_COUNT : 1;
+      pipelineRef.current = createPipelineState(workerSlots);
+      setPipelineView(createPipelineState(workerSlots));
+      setShowBts(false);
 
       // Process and encode ALL frames (memory efficient)
       const processingMode = useMultithreaded ? `AI parallel (${WORKER_COUNT} workers)` : 'streaming';
@@ -326,19 +489,26 @@ function Home() {
         videoBlob = await player.processAndEncodeFramesWithWorkers(null, {
           targetInferenceFrames: TARGET_AI_INFERENCE_FRAMES,
           renderStride: RENDER_FRAME_STRIDE,
+          aiEffect,
           onProgress: (data) => {
             setCurrentFrameIndex(data.current);
             const currentElapsed = Math.floor((Date.now() - startTime) / 1000);
-            setProcessingStatus(`AI Worker: frame ${data.current}/${data.total} - Elapsed: ${currentElapsed}s`);
+            const effectLabel = aiEffect === AI_EFFECT_SEGMENTATION ? 'Pattern fill' : 'FaceMesh';
+            setProcessingStatus(`${effectLabel} Worker: frame ${data.current}/${data.total} - Elapsed: ${currentElapsed}s`);
             setProgress(data.progress);
           },
+          onPipelineEvent: handlePipelineEvent,
         });
       } else {
         // Single-threaded: FaceMesh runs on the main thread (requires window/DOM).
         videoBlob = await player.processAndEncodeFramesStreaming(
           async (ctx, frameIndex, time, frameInfo) => {
             setCurrentFrameIndex(frameIndex);
-            await aiCoolerRenderFunction(ctx, frameIndex, time, frameInfo);
+            if (aiEffect === AI_EFFECT_SEGMENTATION) {
+              await aiSegmentationRenderFunction(ctx, frameIndex, time, frameInfo);
+            } else {
+              await aiCoolerRenderFunction(ctx, frameIndex, time, frameInfo);
+            }
           },
           {
             onProgress: (data) => {
@@ -346,6 +516,13 @@ function Home() {
               const currentElapsed = Math.floor((Date.now() - startTime) / 1000);
               setProcessingStatus(`Processing & encoding frame ${data.current}/${data.total} (${processingMode}) - Elapsed: ${currentElapsed}s`);
               setProgress(data.progress);
+              handlePipelineEvent({ type: 'decoder-start' });
+              handlePipelineEvent({ type: 'worker-receive', workerIndex: 0, frameCount: 1, from: data.current, to: data.current });
+              handlePipelineEvent({ type: 'worker-processed', workerIndex: 0, frameCount: 1, from: data.current, to: data.current });
+              handlePipelineEvent({ type: 'encoder-start', frameIndex: data.current });
+              handlePipelineEvent({ type: 'encoder-frame', workerIndex: 0, frameIndex: data.current });
+              handlePipelineEvent({ type: 'encoder-idle' });
+              handlePipelineEvent({ type: 'decoder-idle', decoded: data.current });
             },
           }
         );
@@ -467,9 +644,27 @@ function Home() {
             <div className="toggle-info">
               {useMultithreaded 
                 ? `Parallel processing with ${WORKER_COUNT} workers (faster rendering)`
-                : 'Single-threaded streaming mode with FaceMesh effects'
+                : 'Single-threaded streaming mode'
               }
             </div>
+          </div>
+          <div className="ai-effect-picker">
+            <label className="ai-effect-label" htmlFor="ai-effect-select">AI effect</label>
+            <select
+              id="ai-effect-select"
+              className="ai-effect-select"
+              value={aiEffect}
+              onChange={(e) => setAiEffect(e.target.value)}
+              disabled={isProcessing}
+            >
+              <option value={AI_EFFECT_FACEMESH}>FaceMesh coolers</option>
+              <option value={AI_EFFECT_SEGMENTATION}>Pattern fill (segmentation)</option>
+            </select>
+            <p className="ai-effect-hint">
+              {aiEffect === AI_EFFECT_SEGMENTATION
+                ? 'Fills the character shape with a random image from src/Patterns every 0.5s.'
+                : 'FaceMesh detects landmarks and draws sunglasses on the face.'}
+            </p>
           </div>
           {error && <div className="error-message">{error}</div>}
         </div>
@@ -477,17 +672,95 @@ function Home() {
 
       {isProcessing && processingStatus && (
         <div className="processing-status-section">
-          <h3>Processing Status</h3>
-          <div className="status-content">
-            <p className="status-message">{processingStatus}</p>
-            <p className="frame-count">
-              Frame {currentFrameIndex + 1} / {totalFrames}
-            </p>
-            <div className="progress-bar">
-              <div className="progress-fill" style={{ width: `${progress * 100}%` }}></div>
-            </div>
-            <p className="progress-percentage">{Math.round(progress * 100)}%</p>
+          <div className="processing-status-header">
+            <h3>{showBts ? 'Behind the scenes' : 'Processing Status'}</h3>
+            <label className="bts-toggle">
+              <input
+                type="checkbox"
+                checked={showBts}
+                onChange={(e) => setShowBts(e.target.checked)}
+              />
+              <span className="bts-toggle-slider"></span>
+              <span className="bts-toggle-text">{showBts ? 'BTS on' : 'View BTS'}</span>
+            </label>
           </div>
+
+          {!showBts && (
+            <div className="status-content">
+              <p className="status-message">{processingStatus}</p>
+              <p className="frame-count">
+                Frame {currentFrameIndex + 1} / {totalFrames}
+              </p>
+              <div className="progress-bar">
+                <div className="progress-fill" style={{ width: `${progress * 100}%` }}></div>
+              </div>
+              <p className="progress-percentage">{Math.round(progress * 100)}%</p>
+            </div>
+          )}
+
+          {showBts && (
+            <div className="bts-dashboard">
+              <p className="bts-legend">
+                {useMultithreaded
+                  ? 'Blocks glow while they hold a frame. A worker stays lit until its batch is handed to the encoder.'
+                  : 'Single-threaded: decode, AI inference, and encode all run on the main thread.'}
+              </p>
+              <div className="bts-workflow">
+                <div className={`bts-node ${pipelineView.decoder.active ? 'bts-node-glow' : ''}`}>
+                  <span className="bts-node-label">Decoder</span>
+                  <span className="bts-node-meta">
+                    {pipelineView.decoder.active ? 'Decoding chunk' : 'Idle'}
+                  </span>
+                  <span className="bts-node-count">{pipelineView.decoder.decoded} frames</span>
+                </div>
+
+                <div className="bts-arrow" aria-hidden="true">→</div>
+
+                {useMultithreaded ? (
+                  <div className="bts-workers">
+                    {pipelineView.workers.map((worker) => {
+                      const glowing = worker.status === 'processing' || worker.status === 'handoff';
+                      const statusLabel = worker.status === 'processing'
+                        ? 'Received · processing'
+                        : worker.status === 'handoff'
+                          ? 'Sending to encoder'
+                          : 'Idle';
+                      return (
+                        <div
+                          key={worker.id}
+                          className={`bts-node bts-worker ${glowing ? 'bts-node-glow' : ''}`}
+                        >
+                          <span className="bts-node-label">Worker {worker.id + 1}</span>
+                          <span className="bts-node-meta">{statusLabel}</span>
+                          {worker.lastFrom != null && (
+                            <span className="bts-node-count">
+                              frames {worker.lastFrom}–{worker.lastTo}
+                            </span>
+                          )}
+                          <span className="bts-node-count">{worker.processed} processed</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="bts-node bts-ai-inference">
+                    <span className="bts-node-label">AI Inference</span>
+                    <span className="bts-node-meta">Main thread</span>
+                  </div>
+                )}
+
+                <div className="bts-arrow" aria-hidden="true">→</div>
+
+                <div className={`bts-node bts-encoder ${pipelineView.encoder.active ? 'bts-node-glow' : ''}`}>
+                  <span className="bts-node-label">Encoder</span>
+                  <span className="bts-node-meta">
+                    {pipelineView.encoder.active ? `Encoding frame ${pipelineView.encoder.frame}` : 'Idle'}
+                  </span>
+                  <span className="bts-node-count">{pipelineView.encoder.encoded} encoded</span>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

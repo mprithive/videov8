@@ -237,11 +237,17 @@ Result: Max memory at any point = 70MB (current batch) + encoded frame
 ✅ **willReadFrequently: true**: Optimizes canvas getImageData()
 
 ### What Doesn't Work
-❌ **Array accumulation**: `results.push()` = memory leak  
-❌ **Promise.all()**: Waiting for everything = holding everything  
-❌ **Large batch sizes**: 1000 frames = 35GB spike  
-❌ **Deferred encoding**: Encode after processing = holding results  
-❌ **Worker-based rendering**: Workers can't access React state/FaceMesh
+❌ **Array accumulation**: `results.push()` into one unbounded array = memory leak  
+❌ **Unbounded look-ahead**: decoding/processing far ahead of the encoder = holding everything  
+❌ **Deferred encoding**: encode only after *all* processing = holding all results
+
+> **Note (superseded):** an earlier version claimed "worker-based rendering
+> doesn't work because workers can't access React state / FaceMesh." That was
+> true for the old `FaceMesh` (which required `window`/DOM). The current build
+> uses `@mediapipe/tasks-vision` `FaceLandmarker`, which runs entirely in a
+> worker via WASM, so **rendering now happens in the workers** (see Section 6).
+> `Promise.all()` is likewise fine now — it awaits a bounded set of worker
+> *pumps*, not all frame results at once.
 
 ### Memory Management Principles
 1. **One direction flow**: Decode → Process → Encode → Release
@@ -254,67 +260,126 @@ Result: Max memory at any point = 70MB (current batch) + encoded frame
 
 ## 6. Current Implementation
 
-### File: `src/lib/videoV8_multithreaded.js`
+> **Updated 2026-08-25.** The core memory principle (encode-as-available, no
+> unbounded accumulation) still holds, but the pipeline has evolved
+> significantly. The historical attempts above remain for context; this section
+> reflects the code as it stands now. See `src/lib/MULTITHREADED_ARCHITECTURE.md`
+> for the full architecture write-up.
 
-**Main Method**: `processAndEncodeFramesWithWorkers()`
-- Creates 3 worker pool
-- Initializes encoder
-- Processes each worker sequentially
-- Encodes frames immediately as they become available
+### Files
 
-**Helper Method**: `processAndEncodeSegmentInWorker()`
-- Decodes frames in 2-frame batches
-- Sends to worker for processing
-- Stores results in `encodedFrameMap`
-- Triggers immediate encoding of available frames
+- **`src/lib/videoV8_multithreaded.js`** — orchestrator (main thread).
+- **`src/lib/faceWorker.js`** — real ES-module Web Worker (replaced the old
+  inline `WORKER_CODE` string). Runs `@mediapipe/tasks-vision` `FaceLandmarker`
+  and composites the effect.
 
-**Worker Code**: `WORKER_CODE`
-- Receives `PROCESS_BATCH` messages (2-4 frames)
-- Applies render function
-- Sends back `PROCESS_BATCH_COMPLETE`
-- Minimal memory overhead
+### Method: `processAndEncodeFramesWithWorkers()`
+
+- Spins up a pool of `WORKER_COUNT = min(navigator.hardwareConcurrency, 8)`
+  workers (no longer hard-coded to 3).
+- Workers run **in parallel** via a **work-stealing pump**: the decoded chunk is
+  split into batches and every worker keeps pulling the next batch off a shared
+  queue until the chunk is drained (`Promise.all(workerPumps)`). This is *not*
+  the old "wait for all results then encode" — encoding is triggered as frames
+  become available.
+
+### Two pipelines (selected by `renderStride`)
+
+- **`renderStride === 1` (default): draw-in-worker.** Each worker receives the
+  full-res frame as a transferred `ImageBitmap`, downscales it to 512px for
+  inference, runs `FaceLandmarker`, composites sunglasses + overlay on a full-res
+  `OffscreenCanvas`, and transfers a **finished `ImageBitmap`** back. The main
+  thread only decodes, blits the finished frame, and encodes.
+- **`renderStride > 1`: legacy main-thread compositing.** Workers return
+  landmark coordinates only; the main thread interpolates between keyframes and
+  draws. Kept as a quality/speed fallback.
+
+### Decode: sequential iterator (major change)
+
+Frames are now pulled from MediaBunny's `sink.samples(startTime, endTime)`
+iterator, which decodes **each packet at most once**. The previous
+`sink.getSample(timestamp)`-per-frame approach re-seeked to the nearest keyframe
+and re-decoded whole GOPs every call — catastrophic on 4K inter-frame video.
+
+### Memory model: budgeted chunks + encode back-pressure
+
+The "1–4 frames in memory" model has been replaced by a deliberate,
+RAM-budgeted buffering scheme (the goal is to keep workers saturated):
+
+1. **Chunk sizing** — `CHUNK_FRAME_COUNT` is derived from
+   `APPROX_DEVICE_MEMORY_GB × MEMORY_BUDGET_FRACTION` (minus worker runtime and a
+   safety reserve), capped at 320 frames.
+2. **Decode / process overlap** — chunk N+1 is decoded on the main thread while
+   the workers process chunk N.
+3. **Encode back-pressure** — `MAX_PENDING_ENCODE` bounds how many
+   finished-but-not-yet-encoded frames may sit in `encodedFrameMap`. If the
+   encoder falls behind, decoding pauses. This is what keeps peak memory bounded
+   now (roughly one chunk of frames in flight, by design).
+
+### Ordering & cleanup (unchanged in spirit)
+
+- `encodedFrameMap` + `nextFrameToEncode` still guarantee in-order encoding,
+  draining only contiguous available frames.
+- Explicit cleanup remains essential: `sample.close()`, `bitmap.close()`,
+  `clearRect()`, and `Map.delete()` after encode.
+- Frame handoffs use **transferable `ImageBitmap`s** (zero-copy), not copied
+  `ImageData`/`ArrayBuffer`s.
 
 ### UI Integration: `src/components/home.js`
-- Timer updates live every ~100ms
-- Shows elapsed seconds during export
-- Progress updates every frame
-- Displays total time on completion
+- Timer updates live; elapsed seconds computed fresh in `onProgress` (avoids the
+  stale-closure bug from Attempt 6).
+- Progress is a two-phase bar: decode fills 0→50%, encode fills 50→100%.
 
 ---
 
 ## 7. Remaining Optimization Opportunities
 
-### Could implement if needed:
-1. **Parallel worker processing**: Launch all 3 workers simultaneously but encode as results arrive
-2. **Dynamic batch sizing**: Adjust BATCH_SIZE based on available memory
-3. **GPU acceleration**: Use WebGL for frame processing instead of canvas
-4. **Shared memory**: Use SharedArrayBuffer for direct memory sharing (security considerations)
-5. **Progressive encoding**: Start encoding while still processing (requires mp4 writer support)
+### Already implemented (were "future" in the original doc)
+- ✅ **Parallel workers, encode-as-available** — work-stealing pump + `encodeChain`.
+- ✅ **Progressive/overlapped encoding** — decode(N+1) overlaps process(N).
+- ✅ **Memory-aware buffering** — chunk size derived from device RAM budget.
+- ✅ **Single-decode pipeline** — sequential `samples()` iterator.
 
-### Current trade-offs:
-- **Sequential workers** (simpler, more stable) vs. **Parallel workers** (potentially faster)
-- **2-frame batches** (lower memory) vs. **10-frame batches** (faster processing)
-- **No render effects in workers** (memory safe) vs. **Worker-based rendering** (not supported)
+### Still open
+1. **Encode throughput** — encode is now the bottleneck (main-thread, serial,
+   one 4K frame at a time). Options: decoder/encoder hardware-accel hints, or
+   segment-based parallel encoding muxed together.
+2. **GPU compositing** — WebGL/WebGPU effects instead of 2D canvas for heavy
+   future effects.
+3. **`SharedArrayBuffer`** — direct memory sharing (needs COOP/COEP headers).
+
+### Current trade-offs
+- **`renderStride = 1`** (every frame, highest quality, draw-in-worker) vs.
+  **`renderStride > 1`** (skip + interpolate, faster, main-thread compositing).
+- **Larger chunks** (better worker saturation) vs. **memory headroom** — tuned
+  via `MEMORY_BUDGET_FRACTION`.
 
 ---
 
 ## 8. Validation Checklist
 
-- [x] Memory stays under 200MB during export
-- [x] No GC lag spikes visible
-- [x] Timer updates correctly
-- [x] Progress shows accurate frame count
-- [x] Output video matches input timing exactly
-- [x] All 2356 frames processed without error
-- [x] Canvas warnings eliminated
-- [x] Workers terminate cleanly
+- [x] Peak memory bounded by the RAM budget (chunk + back-pressure), not by total frame count
+- [x] No unbounded accumulation of decoded or finished frames
+- [x] Decoder and worker pool stay busy simultaneously (decode/process overlap)
+- [x] Each source packet decoded at most once (`samples()` iterator)
+- [x] Output frames encoded strictly in order
+- [x] Timer updates correctly (no stale closure)
+- [x] Progress reflects both decode and encode phases
+- [x] `ImageBitmap`s and samples explicitly closed; workers terminate cleanly
 
 ---
 
 ## 9. Document Summary
 
 ### TL;DR
-The memory leak was caused by **accumulating frame data** before encoding. The fix uses **immediate encoding** with a Map-based frame buffer that only holds frames waiting for encoding. Each batch is decoded, processed, encoded, and released immediately, keeping memory ~150MB instead of 82GB.
+The original memory leak was caused by **accumulating frame data** before
+encoding. The fix was **encode-as-available** ordering via `encodedFrameMap` +
+`nextFrameToEncode`, so results are never held all at once. The current build
+keeps that principle but replaces the ultra-conservative "2–4 frames in memory"
+model with a **RAM-budgeted chunk pipeline plus encode back-pressure**
+(`MAX_PENDING_ENCODE`): it deliberately buffers a bounded number of frames to
+keep the parallel workers saturated, while peak memory stays capped by the
+device-memory budget rather than by total frame count. (See Section 6.)
 
 ### Key Code Pattern
 ```javascript

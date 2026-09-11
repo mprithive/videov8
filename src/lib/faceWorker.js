@@ -1,24 +1,30 @@
 /* eslint-disable no-restricted-globals */
 /**
- * faceWorker.js — Web Worker for parallel AI-powered face effect processing
+ * faceWorker.js — Web Worker for parallel AI effect processing
  *
- * Uses @mediapipe/tasks-vision FaceLandmarker which runs entirely in Web Workers
- * via WebAssembly (no DOM, no window required).
+ * Uses @mediapipe/tasks-vision (FaceLandmarker or ImageSegmenter) which runs
+ * entirely in Web Workers via WebAssembly (no DOM, no window required).
  *
- * Pipeline per frame:
- *   receive small detect bitmap  →  FaceLandmarker.detectForVideo()
- *   →  return lightweight overlay metadata to main thread
+ * Selected by INIT payload.aiEffect:
+ *   'facemesh'      — FaceLandmarker + sunglasses overlay (default)
+ *   'segmentation'  — selfie ImageSegmenter + pattern fill in the character
  */
 
-import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import { FaceLandmarker, ImageSegmenter, FilesetResolver } from '@mediapipe/tasks-vision';
+import { applyPatternFill, createSegmentationAux, loadPatternBitmaps, pickPatternIndex, SELFIE_SEGMENTER_MODEL } from './segmentationEffect.js';
 
 // ─── Worker state ─────────────────────────────────────────────────────────────
+let aiEffect = 'facemesh';
 let faceLandmarker = null;
+let imageSegmenter = null;
 let detectCtx = null;   // small OffscreenCanvas — used ONLY for inference
 let drawCtx = null;     // full-res OffscreenCanvas — used to composite effects (draw-in-worker mode)
+let segmentationAux = null;
+let patternBitmaps = [];
 let workerWidth = 0;
 let workerHeight = 0;
 let cachedLandmarks = null;
+let cachedCategoryMask = null;
 let cachedInferenceFrameIndex = Number.NEGATIVE_INFINITY;
 
 // ─── Message dispatcher ───────────────────────────────────────────────────────
@@ -37,16 +43,16 @@ self.onmessage = async (event) => {
 };
 
 // ─── Initialise ───────────────────────────────────────────────────────────────
-async function handleInit({ width, height, wasmBasePath, delegate = 'GPU' }) {
+async function handleInit({ width, height, wasmBasePath, delegate = 'GPU', aiEffect: effect = 'facemesh' }) {
+	aiEffect = effect === 'segmentation' ? 'segmentation' : 'facemesh';
 	workerWidth = width;
 	workerHeight = height;
 	cachedLandmarks = null;
+	cachedCategoryMask = null;
 	cachedInferenceFrameIndex = Number.NEGATIVE_INFINITY;
 
-	// Small detect canvas — AI inference runs here (9× fewer pixels than 1080p)
-	// FaceLandmarker returns normalised landmarks (0-1), so resolution doesn't
-	// affect landmark accuracy — only inference speed.
-	const DETECT_W = 512;
+	// Segmentation is cheaper at 256px; landmarks stay at 512px.
+	const DETECT_W = aiEffect === 'segmentation' ? 256 : 512;
 	const DETECT_H = Math.round(DETECT_W * height / width);
 	const detectOffscreen = new OffscreenCanvas(DETECT_W, DETECT_H);
 	detectCtx = detectOffscreen.getContext('2d');
@@ -58,41 +64,65 @@ async function handleInit({ width, height, wasmBasePath, delegate = 'GPU' }) {
 	const drawOffscreen = new OffscreenCanvas(width, height);
 	drawCtx = drawOffscreen.getContext('2d', { willReadFrequently: false });
 
+	if (aiEffect === 'segmentation') {
+		segmentationAux = createSegmentationAux();
+		try {
+			patternBitmaps = await loadPatternBitmaps();
+		} catch (err) {
+			console.warn('faceWorker: failed to load pattern images:', err.message);
+			patternBitmaps = [];
+		}
+	}
+
 	try {
 		// Use locally-served wasm files (public/mediapipe-wasm/) — no CDN dependency.
 		// wasmBasePath is passed from the main thread as window.location.origin + '/mediapipe-wasm'.
 		const filesetResolver = await FilesetResolver.forVisionTasks(wasmBasePath);
 
-		faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
-			baseOptions: {
-				// Model is ~4 MB, downloaded once and browser-cached.
-				modelAssetPath:
-					'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-				// Multiple workers competing for one GPU usually serialize throughput.
-				// CPU delegate scales better across workers because each worker gets its
-				// own core instead of contending for the same GPU queue.
-				delegate,
-			},
-			runningMode: 'VIDEO',
-			numFaces: 1,
-			outputFaceBlendshapes: false,
-			outputFacialTransformationMatrixes: false,
-		});
-
-		console.log(`faceWorker: FaceLandmarker ready (${delegate}, ${DETECT_W}w, VIDEO mode)`);
+		if (aiEffect === 'segmentation') {
+			imageSegmenter = await ImageSegmenter.createFromOptions(filesetResolver, {
+				baseOptions: {
+					modelAssetPath: SELFIE_SEGMENTER_MODEL,
+					delegate,
+				},
+				runningMode: 'VIDEO',
+				outputCategoryMask: true,
+				outputConfidenceMasks: false,
+			});
+			console.log(`faceWorker: ImageSegmenter ready (${delegate}, ${DETECT_W}w, VIDEO mode)`);
+		} else {
+			faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+				baseOptions: {
+					// Model is ~4 MB, downloaded once and browser-cached.
+					modelAssetPath:
+						'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+					// Multiple workers competing for one GPU usually serialize throughput.
+					// CPU delegate scales better across workers because each worker gets its
+					// own core instead of contending for the same GPU queue.
+					delegate,
+				},
+				runningMode: 'VIDEO',
+				numFaces: 1,
+				outputFaceBlendshapes: false,
+				outputFacialTransformationMatrixes: false,
+			});
+			console.log(`faceWorker: FaceLandmarker ready (${delegate}, ${DETECT_W}w, VIDEO mode)`);
+		}
 	} catch (err) {
 		// AI init failure is non-fatal — frames are passed through without effects
-		console.warn('faceWorker: FaceLandmarker init failed, running without AI:', err.message);
+		console.warn(`faceWorker: ${aiEffect} init failed, running without AI:`, err.message);
 		faceLandmarker = null;
+		imageSegmenter = null;
 	}
 
-	self.postMessage({ type: 'INIT_COMPLETE', ready: true });
+	self.postMessage({ type: 'INIT_COMPLETE', ready: true, aiEffect });
 }
 
 // ─── Batch processing ─────────────────────────────────────────────────────────
 async function handleProcessBatch({ frames, width, height, inferenceStride = 1, drawInWorker = false }) {
 	const processedFrames = [];
 	const transferables = [];
+	const useSegmentation = aiEffect === 'segmentation';
 
 	for (const frame of frames) {
 		const { frameIndex, timestamp } = frame;
@@ -101,38 +131,51 @@ async function handleProcessBatch({ frames, width, height, inferenceStride = 1, 
 		// bitmap per frame). Otherwise it receives a pre-made small detect bitmap.
 		const detectSource = drawInWorker ? frame.fullBitmap : frame.detectBitmap;
 
-		// AI inference — normalised landmarks (0-1) are resolution-independent, so
-		// tracking runs on a small frame while effects draw at full resolution.
-		if (faceLandmarker && detectSource) {
+		if (detectSource) {
 			try {
-				const shouldInfer = !cachedLandmarks || (frameIndex - cachedInferenceFrameIndex) >= inferenceStride;
+				const shouldInfer = (useSegmentation ? !cachedCategoryMask : !cachedLandmarks)
+					|| (frameIndex - cachedInferenceFrameIndex) >= inferenceStride;
 				if (shouldInfer) {
 					detectCtx.clearRect(0, 0, detectCtx.canvas.width, detectCtx.canvas.height);
 					detectCtx.drawImage(detectSource, 0, 0, detectCtx.canvas.width, detectCtx.canvas.height);
-					const result = faceLandmarker.detectForVideo(detectCtx.canvas, timestamp);
-					cachedInferenceFrameIndex = frameIndex;
-					cachedLandmarks = result.faceLandmarks && result.faceLandmarks.length > 0
-						? result.faceLandmarks[0]
-						: null;
+
+					if (useSegmentation && imageSegmenter) {
+						cachedCategoryMask = runSegmenter(detectCtx.canvas, timestamp);
+						cachedInferenceFrameIndex = frameIndex;
+					} else if (!useSegmentation && faceLandmarker) {
+						const result = faceLandmarker.detectForVideo(detectCtx.canvas, timestamp);
+						cachedInferenceFrameIndex = frameIndex;
+						cachedLandmarks = result.faceLandmarks && result.faceLandmarks.length > 0
+							? result.faceLandmarks[0]
+							: null;
+					}
 				}
 			} catch (e) {
-				// Frame passes through with last-known landmarks if inference throws
+				// Frame passes through with last-known result if inference throws
 			}
 		}
 
 		if (drawInWorker) {
 			// Composite the finished frame entirely inside the worker, then hand a
 			// ready-to-encode ImageBitmap back to the main thread (transferable).
-			drawCtx.clearRect(0, 0, width, height);
-			if (frame.fullBitmap) {
-				drawCtx.drawImage(frame.fullBitmap, 0, 0, width, height);
-			}
-			if (cachedLandmarks) {
-				drawSunglasses(drawCtx, cachedLandmarks, width, height);
+			if (useSegmentation) {
+				const pattern = patternBitmaps.length > 0
+					? patternBitmaps[pickPatternIndex(timestamp, patternBitmaps.length)]
+					: null;
+				applyPatternFill(drawCtx, frame.fullBitmap, cachedCategoryMask, segmentationAux, pattern, width, height);
+				drawOverlay(drawCtx, frameIndex, cachedCategoryMask ? '| Pattern \u2713' : '| No Person');
 			} else {
-				drawOverlay(drawCtx, frameIndex, '| No Face');
+				drawCtx.clearRect(0, 0, width, height);
+				if (frame.fullBitmap) {
+					drawCtx.drawImage(frame.fullBitmap, 0, 0, width, height);
+				}
+				if (cachedLandmarks) {
+					drawSunglasses(drawCtx, cachedLandmarks, width, height);
+				} else {
+					drawOverlay(drawCtx, frameIndex, '| No Face');
+				}
+				drawOverlay(drawCtx, frameIndex, cachedLandmarks ? '| AI Worker \u2713' : '| Worker');
 			}
-			drawOverlay(drawCtx, frameIndex, cachedLandmarks ? '| AI Worker \u2713' : '| Worker');
 
 			const rendered = drawCtx.canvas.transferToImageBitmap();
 			if (frame.fullBitmap) frame.fullBitmap.close();
@@ -151,6 +194,26 @@ async function handleProcessBatch({ frames, width, height, inferenceStride = 1, 
 	}
 
 	self.postMessage({ type: 'PROCESS_BATCH_COMPLETE', payload: { processedFrames } }, transferables);
+}
+
+function runSegmenter(canvas, timestamp) {
+	let copied = null;
+	imageSegmenter.segmentForVideo(canvas, timestamp, (result) => {
+		copied = copyCategoryMask(result.categoryMask);
+	});
+	return copied;
+}
+
+function copyCategoryMask(mask) {
+	if (!mask) return null;
+	const src = mask.getAsUint8Array();
+	const data = new Uint8Array(src.length);
+	data.set(src);
+	return {
+		width: mask.width,
+		height: mask.height,
+		getAsUint8Array: () => data,
+	};
 }
 
 // ─── Effect drawing (runs inside the worker in draw-in-worker mode) ─────────────
@@ -215,7 +278,16 @@ function handleTerminate() {
 		try { faceLandmarker.close(); } catch (_) {}
 		faceLandmarker = null;
 	}
+	if (imageSegmenter) {
+		try { imageSegmenter.close(); } catch (_) {}
+		imageSegmenter = null;
+	}
 	cachedLandmarks = null;
+	cachedCategoryMask = null;
 	cachedInferenceFrameIndex = Number.NEGATIVE_INFINITY;
+	for (const bitmap of patternBitmaps) {
+		try { bitmap.close(); } catch (_) {}
+	}
+	patternBitmaps = [];
 	self.postMessage({ type: 'TERMINATED' });
 }

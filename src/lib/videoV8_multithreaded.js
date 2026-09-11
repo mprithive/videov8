@@ -30,6 +30,7 @@ class VideoV8Multithreaded {
 		this.workerCount = options.workerCount || 3;
 		this.approxDeviceMemoryGB = options.approxDeviceMemoryGB || 8;
 		this.memoryBudgetFraction = options.memoryBudgetFraction || 0.4;
+		this.aiEffect = options.aiEffect || 'facemesh';
 		this.workers = [];
 		this.workerPool = [];
 		this.frameQueue = [];
@@ -127,7 +128,7 @@ class VideoV8Multithreaded {
 						worker.onmessage = (event) => {
 							if (event.data.type === 'INIT_COMPLETE') {
 								clearTimeout(initTimeout);
-								console.log(`Worker ${i} ready (FaceLandmarker AI loaded)`);
+								console.log(`Worker ${i} ready (${this.aiEffect} AI loaded)`);
 								readyCount++;
 								resolveWorker();
 							}
@@ -144,7 +145,7 @@ class VideoV8Multithreaded {
 						const wasmBasePath = `${window.location.origin}${process.env.PUBLIC_URL || ''}/mediapipe-wasm`;
 						worker.postMessage({
 							type: 'INIT',
-							payload: { width: this.width, height: this.height, wasmBasePath, delegate },
+							payload: { width: this.width, height: this.height, wasmBasePath, delegate, aiEffect: this.aiEffect },
 						});
 
 						this.workers.push(worker);
@@ -191,13 +192,21 @@ class VideoV8Multithreaded {
 			endTime = this.duration,
 			targetInferenceFrames = 160,
 			renderStride = 4,
+			aiEffect = this.aiEffect || 'facemesh',
 			onProgress = null,
+			onPipelineEvent = null,
 		} = options;
+
+		this.aiEffect = aiEffect;
+		const emitPipeline = (event) => {
+			if (onPipelineEvent) onPipelineEvent(event);
+		};
 
 		try {
 			console.log('Initializing worker pool for true parallel processing...');
 			await this.initializeWorkerPool();
 			console.log(`${this.workers.length} workers ready`);
+			emitPipeline({ type: 'pipeline-ready', workerCount: this.workers.length });
 
 			const frameInterval = 1 / this.frameRate;
 			const frameDuration = 1 / this.frameRate;
@@ -219,8 +228,8 @@ class VideoV8Multithreaded {
 			// The main thread is then reduced to decode → transfer → encode. For
 			// renderStride > 1 we keep the legacy main-thread compositor because
 			// interpolation needs neighbouring keyframes that live in other batches.
-			const DRAW_IN_WORKER = renderStride === 1;
-			console.log(`Draw-in-worker pipeline: ${DRAW_IN_WORKER ? 'ON (parallel AI + drawing)' : 'OFF (main-thread compositing)'}`);
+			const DRAW_IN_WORKER = renderStride === 1 || this.aiEffect === 'segmentation';
+			console.log(`Draw-in-worker pipeline: ${DRAW_IN_WORKER ? 'ON (parallel AI + drawing)' : 'OFF (main-thread compositing)'} | effect: ${this.aiEffect}`);
 
 			// Initialize output encoder
 			const output = new Output({
@@ -341,9 +350,19 @@ class VideoV8Multithreaded {
 
 			const scheduleEncode = () => {
 				encodeChain = encodeChain.then(async () => {
+					let encoding = false;
 					while (encodedFrameMap.has(nextFrameToEncode) && (DRAW_IN_WORKER || nextFrameToEncode < totalFrames)) {
 						const frameData = encodedFrameMap.get(nextFrameToEncode);
 						encodedFrameMap.delete(nextFrameToEncode);
+						if (!encoding) {
+							emitPipeline({ type: 'encoder-start', frameIndex: nextFrameToEncode });
+							encoding = true;
+						}
+						emitPipeline({
+							type: 'encoder-frame',
+							frameIndex: nextFrameToEncode,
+							workerIndex: frameData.workerIndex,
+						});
 
 						// Draw-in-worker mode: the worker already composited the full frame.
 						// The main thread just blits it onto the encode canvas, in order.
@@ -404,6 +423,9 @@ class VideoV8Multithreaded {
 							});
 						}
 					}
+					if (encoding) {
+						emitPipeline({ type: 'encoder-idle', frameIndex: nextFrameToEncode });
+					}
 				});
 				return encodeChain;
 			};
@@ -427,7 +449,7 @@ class VideoV8Multithreaded {
 					? frames.map(f => f.fullBitmap).filter(Boolean)
 					: frames.map(f => f.detectBitmap).filter(Boolean);
 				worker.postMessage(
-					{ type: 'PROCESS_BATCH', payload: { frames, width: this.width, height: this.height, inferenceStride: effectiveInferenceStride, drawInWorker: DRAW_IN_WORKER } },
+					{ type: 'PROCESS_BATCH', payload: { frames, width: this.width, height: this.height, inferenceStride: effectiveInferenceStride, drawInWorker: DRAW_IN_WORKER, aiEffect: this.aiEffect } },
 					transferables
 				);
 			});
@@ -481,6 +503,7 @@ class VideoV8Multithreaded {
 				const coverageBySource = new Map();
 				const bitmapRefs = new Map();
 				let currentSourceFrameIndex = null;
+				emitPipeline({ type: 'decoder-start', from: rangeStart, to: rangeEnd });
 
 				for (let fi = rangeStart; fi < rangeEnd; fi++) {
 					const shouldDecodeFrame = currentSourceFrameIndex === null || ((fi - rangeStart) % renderStride === 0);
@@ -534,6 +557,7 @@ class VideoV8Multithreaded {
 					}
 				}
 
+				emitPipeline({ type: 'decoder-idle', decoded: totalDecoded });
 				return { decodedFrames, coverageBySource, bitmapRefs };
 			};
 
@@ -550,13 +574,27 @@ class VideoV8Multithreaded {
 			const processChunk = async (chunkFrames) => {
 				const batches = buildChunkBatches(chunkFrames.decodedFrames);
 				const sourceFrameResults = new Map();
-				const workerPumps = this.workers.map((worker) => (async () => {
+				const workerPumps = this.workers.map((worker, workerIndex) => (async () => {
 					while (batches.length > 0) {
 						const batch = batches.shift();
 						if (!batch) return;
+						emitPipeline({
+							type: 'worker-receive',
+							workerIndex,
+							frameCount: batch.length,
+							from: batch[0].frameIndex,
+							to: batch[batch.length - 1].frameIndex,
+						});
 						const results = await sendToWorker(worker, batch);
+						emitPipeline({
+							type: 'worker-processed',
+							workerIndex,
+							frameCount: results.length,
+							from: results[0] ? results[0].frameIndex : null,
+							to: results[results.length - 1] ? results[results.length - 1].frameIndex : null,
+						});
 						for (const frame of results) {
-							sourceFrameResults.set(frame.frameIndex, frame);
+							sourceFrameResults.set(frame.frameIndex, { ...frame, workerIndex });
 						}
 					}
 				})());
@@ -567,7 +605,7 @@ class VideoV8Multithreaded {
 					// Workers already produced finished frames (1:1 with output frames
 					// because renderStride === 1). Queue them straight for in-order encode.
 					for (const [frameIndex, result] of sourceFrameResults) {
-						encodedFrameMap.set(frameIndex, { rendered: result.rendered });
+						encodedFrameMap.set(frameIndex, { rendered: result.rendered, workerIndex: result.workerIndex });
 					}
 					scheduleEncode();
 					return;
@@ -600,6 +638,7 @@ class VideoV8Multithreaded {
 							landmarks: sourceResult ? sourceResult.landmarks : null,
 							nextLandmarks: nextSourceResult ? nextSourceResult.landmarks : null,
 							blendAlpha,
+							workerIndex: sourceResult ? sourceResult.workerIndex : undefined,
 						});
 					}
 				}
@@ -622,6 +661,7 @@ class VideoV8Multithreaded {
 
 				const decodeNextChunk = async () => {
 					const decodedFrames = [];
+					emitPipeline({ type: 'decoder-start' });
 					for (let n = 0; n < CHUNK_FRAME_COUNT; n++) {
 						const { value: sample, done } = await sampleIterator.next();
 						if (done || !sample) { iteratorDone = true; break; }
@@ -643,6 +683,7 @@ class VideoV8Multithreaded {
 							});
 						}
 					}
+					emitPipeline({ type: 'decoder-idle', decoded: decodedOutputIndex });
 					return { decodedFrames, coverageBySource: new Map(), bitmapRefs: new Map() };
 				};
 
