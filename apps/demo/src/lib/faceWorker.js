@@ -12,6 +12,7 @@
 
 import { FaceLandmarker, ImageSegmenter, FilesetResolver } from '@mediapipe/tasks-vision';
 import { applyPatternFill, createSegmentationAux, loadPatternBitmaps, pickPatternIndex, SELFIE_SEGMENTER_MODEL } from './segmentationEffect.js';
+import { drawCoolers, loadCoolersBitmap } from './coolersEffect.js';
 
 // ─── Worker state ─────────────────────────────────────────────────────────────
 let aiEffect = 'facemesh';
@@ -21,6 +22,7 @@ let detectCtx = null;   // small OffscreenCanvas — used ONLY for inference
 let drawCtx = null;     // full-res OffscreenCanvas — used to composite effects (draw-in-worker mode)
 let segmentationAux = null;
 let patternBitmaps = [];
+let coolersBitmap = null;
 let workerWidth = 0;
 let workerHeight = 0;
 let cachedLandmarks = null;
@@ -71,6 +73,13 @@ async function handleInit({ width, height, wasmBasePath, delegate = 'GPU', aiEff
 		} catch (err) {
 			console.warn('faceWorker: failed to load pattern images:', err.message);
 			patternBitmaps = [];
+		}
+	} else {
+		try {
+			coolersBitmap = await loadCoolersBitmap();
+		} catch (err) {
+			console.warn('faceWorker: failed to load coolers.png:', err.message);
+			coolersBitmap = null;
 		}
 	}
 
@@ -170,7 +179,7 @@ async function handleProcessBatch({ frames, width, height, inferenceStride = 1, 
 					drawCtx.drawImage(frame.fullBitmap, 0, 0, width, height);
 				}
 				if (cachedLandmarks) {
-					drawSunglasses(drawCtx, cachedLandmarks, width, height);
+					drawCoolers(drawCtx, cachedLandmarks, width, height, coolersBitmap);
 				} else {
 					drawOverlay(drawCtx, frameIndex, '| No Face');
 				}
@@ -216,53 +225,6 @@ function copyCategoryMask(mask) {
 	};
 }
 
-// ─── Effect drawing (runs inside the worker in draw-in-worker mode) ─────────────
-function drawSunglasses(ctx, landmarks, width, height) {
-	const lx = (lm) => lm.x * width;
-	const ly = (lm) => lm.y * height;
-
-	const leftCX = (lx(landmarks[133]) + lx(landmarks[33])) / 2;
-	const leftCY = (ly(landmarks[160]) + ly(landmarks[145])) / 2;
-	const leftRX = Math.abs(lx(landmarks[33]) - lx(landmarks[133])) / 2 + 15;
-	const leftRY = Math.abs(ly(landmarks[145]) - ly(landmarks[160])) / 2 + 12;
-
-	const rightCX = (lx(landmarks[263]) + lx(landmarks[362])) / 2;
-	const rightCY = (ly(landmarks[387]) + ly(landmarks[374])) / 2;
-	const rightRX = Math.abs(lx(landmarks[362]) - lx(landmarks[263])) / 2 + 15;
-	const rightRY = Math.abs(ly(landmarks[374]) - ly(landmarks[387])) / 2 + 12;
-
-	const grad = ctx.createLinearGradient(0, leftCY - leftRY, 0, leftCY + leftRY);
-	grad.addColorStop(0, 'rgba(40,40,40,0.85)');
-	grad.addColorStop(0.5, 'rgba(20,20,20,0.9)');
-	grad.addColorStop(1, 'rgba(40,40,40,0.85)');
-
-	ctx.fillStyle = grad;
-	ctx.strokeStyle = '#1a1a1a';
-	ctx.lineWidth = 4;
-
-	ctx.beginPath();
-	ctx.ellipse(leftCX, leftCY, leftRX, leftRY, 0, 0, 2 * Math.PI);
-	ctx.fill();
-	ctx.stroke();
-
-	ctx.beginPath();
-	ctx.ellipse(rightCX, rightCY, rightRX, rightRY, 0, 0, 2 * Math.PI);
-	ctx.fill();
-	ctx.stroke();
-
-	ctx.beginPath();
-	ctx.moveTo(leftCX + leftRX, leftCY);
-	ctx.lineTo(rightCX - rightRX, rightCY);
-	ctx.stroke();
-
-	ctx.fillStyle = 'rgba(255,255,255,0.15)';
-	for (const [cx, cy, rx, ry] of [[leftCX, leftCY, leftRX, leftRY], [rightCX, rightCY, rightRX, rightRY]]) {
-		ctx.beginPath();
-		ctx.ellipse(cx - rx / 3, cy - ry / 2.5, rx / 4, ry / 4, -0.3, 0, 2 * Math.PI);
-		ctx.fill();
-	}
-}
-
 function drawOverlay(ctx, frameIndex, suffix) {
 	ctx.font = 'bold 14px Arial';
 	ctx.shadowColor = 'rgba(0,0,0,0.7)';
@@ -289,5 +251,9 @@ function handleTerminate() {
 		try { bitmap.close(); } catch (_) {}
 	}
 	patternBitmaps = [];
+	if (coolersBitmap) {
+		try { coolersBitmap.close(); } catch (_) {}
+		coolersBitmap = null;
+	}
 	self.postMessage({ type: 'TERMINATED' });
 }

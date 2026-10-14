@@ -1,12 +1,12 @@
 import './App.css';
-import Home from './components/home';
 import MemoryWidget from './components/MemoryWidget';
+import VideoV8Sample from './sample/videov8Sample';
 
 function App() {
   return (
     <div className="App">
       <MemoryWidget />
-      <Home />
+      <VideoV8Sample />
     </div>
   );
 }

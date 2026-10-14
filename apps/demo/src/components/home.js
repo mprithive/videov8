@@ -3,22 +3,61 @@ import './home.css';
 import VideoV8 from '../lib/videoV8';
 import VideoV8Multithreaded from '../lib/videoV8_multithreaded';
 import { applyPatternFill, createSegmentationAux, loadPatternBitmaps, pickPatternIndex, SELFIE_SEGMENTER_MODEL } from '../lib/segmentationEffect';
+import { drawCoolers, loadCoolersBitmap } from '../lib/coolersEffect';
 
-// ── Worker count ─────────────────────────────────────────────────────────────
-// Change this number to experiment. Each worker loads its own FaceLandmarker
-// WASM runtime (~100 MB RAM each). Recommended range: 2–6.
-// Your machine has navigator.hardwareConcurrency cores available.
+
 const WORKER_COUNT = Math.min(navigator.hardwareConcurrency || 4, 8);
 const TARGET_AI_INFERENCE_FRAMES = 160;
 const APPROX_DEVICE_MEMORY_GB = navigator.deviceMemory || 8;
 const MEMORY_BUDGET_FRACTION = 0.4;
-// renderStride = 1 renders every frame (no frames skipped / interpolated) and
-// unlocks the draw-in-worker pipeline: each worker does AI inference AND effect
-// compositing in parallel, so the main thread only decodes and encodes.
-// Increase (e.g. 3) to trade quality for speed via keyframe interpolation.
+
 const RENDER_FRAME_STRIDE = 1;
 const AI_EFFECT_FACEMESH = 'facemesh';
 const AI_EFFECT_SEGMENTATION = 'segmentation';
+
+const DEMO_VIDEOS = [
+  {
+    id: 'demo_portrait_4k_25',
+    label: 'Portrait 4K',
+    fileName: 'demo_portrait_4k_25.mp4',
+    src: new URL('../videos/demo_portrait_4k_25.mp4', import.meta.url).href,
+  },
+  {
+    id: 'demo_cine_4k_6',
+    label: 'Cine 4K',
+    fileName: 'demo_cine_4k_6.mp4',
+    src: new URL('../videos/demo_cine_4k_6.mp4', import.meta.url).href,
+  },
+];
+
+function DemoVideoCard({ src, label, selected, loading, disabled, onClick }) {
+  const videoRef = useRef(null);
+
+  const showFirstFrame = () => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return;
+    video.currentTime = Math.min(0.2, video.duration * 0.05);
+  };
+
+  return (
+    <button
+      type="button"
+      className={`source-card demo-card${selected ? ' demo-card-selected' : ''}`}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      <video
+        ref={videoRef}
+        src={src}
+        muted
+        playsInline
+        preload="metadata"
+        onLoadedMetadata={showFirstFrame}
+      />
+      <span className="demo-card-label">{loading ? 'Loading…' : label}</span>
+    </button>
+  );
+}
 
 function createPipelineState(workerCount) {
   return {
@@ -52,6 +91,8 @@ function Home() {
   const [exportStartTime, setExportStartTime] = useState(null);
   const [elapsedTime, setElapsedTime] = useState(0);
   const [showBts, setShowBts] = useState(false);
+  const [isLoadingVideo, setIsLoadingVideo] = useState(false);
+  const [activeSource, setActiveSource] = useState(null);
   const [pipelineView, setPipelineView] = useState(() => createPipelineState(WORKER_COUNT));
   const fileInputRef = useRef(null);
   const playerRef = useRef(null);
@@ -191,79 +232,14 @@ function Home() {
         faceMesh.send({ image: canvas });
       });
 
-      // Draw coolers if face is detected
+      // Draw coolers.png over the eyes if a face is detected
       if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
         const landmarks = results.multiFaceLandmarks[0];
+        if (!window.coolersBitmap) {
+          window.coolersBitmap = await loadCoolersBitmap();
+        }
+        drawCoolers(ctx, landmarks, width, height, window.coolersBitmap);
 
-        // Key eye landmarks (normalized coordinates)
-        const leftEyeOuter = landmarks[33];
-        const leftEyeInner = landmarks[133];
-        const leftEyeTop = landmarks[160];
-        const leftEyeBottom = landmarks[145];
-
-        const rightEyeOuter = landmarks[362];
-        const rightEyeInner = landmarks[263];
-        const rightEyeTop = landmarks[387];
-        const rightEyeBottom = landmarks[374];
-
-        // Convert normalized coordinates to pixel coordinates
-        const toPixelX = (x) => x * width;
-        const toPixelY = (y) => y * height;
-
-        // Calculate eye centers and radii - LARGER for cooler look
-        const leftEyeCenterX = (toPixelX(leftEyeInner.x) + toPixelX(leftEyeOuter.x)) / 2;
-        const leftEyeCenterY = (toPixelY(leftEyeTop.y) + toPixelY(leftEyeBottom.y)) / 2;
-        const leftEyeRadiusX = Math.abs(toPixelX(leftEyeOuter.x) - toPixelX(leftEyeInner.x)) / 2 + 15;
-        const leftEyeRadiusY = Math.abs(toPixelY(leftEyeBottom.y) - toPixelY(leftEyeTop.y)) / 2 + 12;
-
-        const rightEyeCenterX = (toPixelX(rightEyeInner.x) + toPixelX(rightEyeOuter.x)) / 2;
-        const rightEyeCenterY = (toPixelY(rightEyeTop.y) + toPixelY(rightEyeBottom.y)) / 2;
-        const rightEyeRadiusX = Math.abs(toPixelX(rightEyeOuter.x) - toPixelX(rightEyeInner.x)) / 2 + 15;
-        const rightEyeRadiusY = Math.abs(toPixelY(rightEyeBottom.y) - toPixelY(rightEyeTop.y)) / 2 + 12;
-
-        // Draw cooler frames with dark, trendy style
-        ctx.strokeStyle = '#1a1a1a'; // Very dark/black frame color
-        ctx.lineWidth = 4; // Thicker frames for cooler look
-        
-        // Dark gradient lens for sunglasses effect
-        const gradient = ctx.createLinearGradient(0, leftEyeCenterY - leftEyeRadiusY, 0, leftEyeCenterY + leftEyeRadiusY);
-        gradient.addColorStop(0, 'rgba(40, 40, 40, 0.85)');
-        gradient.addColorStop(0.5, 'rgba(20, 20, 20, 0.9)');
-        gradient.addColorStop(1, 'rgba(40, 40, 40, 0.85)');
-        ctx.fillStyle = gradient;
-
-        // Left cooler lens
-        ctx.beginPath();
-        ctx.ellipse(leftEyeCenterX, leftEyeCenterY, leftEyeRadiusX, leftEyeRadiusY, 0, 0, 2 * Math.PI);
-        ctx.fill();
-        ctx.stroke();
-
-        // Right cooler lens
-        ctx.beginPath();
-        ctx.ellipse(rightEyeCenterX, rightEyeCenterY, rightEyeRadiusX, rightEyeRadiusY, 0, 0, 2 * Math.PI);
-        ctx.fill();
-        ctx.stroke();
-
-        // Bridge connecting the lenses - thicker and cooler
-        ctx.strokeStyle = '#1a1a1a';
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.moveTo(leftEyeCenterX + leftEyeRadiusX, leftEyeCenterY);
-        ctx.lineTo(rightEyeCenterX - rightEyeRadiusX, rightEyeCenterY);
-        ctx.stroke();
-
-        // Add shine effect on left lens
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
-        ctx.beginPath();
-        ctx.ellipse(leftEyeCenterX - leftEyeRadiusX / 3, leftEyeCenterY - leftEyeRadiusY / 2.5, leftEyeRadiusX / 4, leftEyeRadiusY / 4, -0.3, 0, 2 * Math.PI);
-        ctx.fill();
-
-        // Add shine effect on right lens
-        ctx.beginPath();
-        ctx.ellipse(rightEyeCenterX - rightEyeRadiusX / 3, rightEyeCenterY - rightEyeRadiusY / 2.5, rightEyeRadiusX / 4, rightEyeRadiusY / 4, -0.3, 0, 2 * Math.PI);
-        ctx.fill();
-
-        // Draw text overlay with detection info
         ctx.fillStyle = '#ffffff';
         ctx.font = 'bold 14px Arial';
         ctx.shadowColor = 'rgba(0, 0, 0, 0.7)';
@@ -354,29 +330,21 @@ function Home() {
     }
   };
 
-  // Handle file upload
-  const handleUpload = async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-
-    // Validate file type
-    if (!file.type.includes('video/mp4') && !file.type.includes('video')) {
-      setError('Please upload a valid video file (MP4)');
-      return;
-    }
+  const loadVideoFile = async (file, sourceId = 'upload') => {
+    setError(null);
+    setIsLoadingVideo(true);
+    setActiveSource(sourceId);
+    setVideoFile(file);
+    setThumbnailUrl(null);
+    setProgress(0);
+    setDownloadUrl(null);
+    setDownloadFileName(null);
+    setTotalFrames(0);
+    setCurrentFrameIndex(0);
+    setProcessingStatus('');
+    setMetadata(null);
 
     try {
-      setError(null);
-      setVideoFile(file);
-      setThumbnailUrl(null);
-      setProgress(0);
-      setDownloadUrl(null);
-      setDownloadFileName(null);
-      setTotalFrames(0);
-      setCurrentFrameIndex(0);
-      setProcessingStatus('');
-
-      // Initialize VideoV8 player (single-threaded or multithreaded)
       const player = useMultithreaded
         ? new VideoV8Multithreaded({
             workerCount: WORKER_COUNT,
@@ -390,25 +358,69 @@ function Home() {
         setError(err.message);
       };
 
-      // Load the video
       const loaded = await player.loadVideo(file);
       if (!loaded) {
         setError('Failed to load video');
+        setVideoFile(null);
+        setActiveSource(null);
         return;
       }
 
       playerRef.current = player;
 
-      // Extract and display thumbnail
       const thumbnailCanvas = await player.getThumbnail(0);
       const thumbUrl = thumbnailCanvas.toDataURL('image/png');
       setThumbnailUrl(thumbUrl);
-
-      // Store metadata
       setMetadata(player.getMetadata());
     } catch (err) {
       console.error('Error loading video:', err);
       setError(err.message);
+      setVideoFile(null);
+      setActiveSource(null);
+    } finally {
+      setIsLoadingVideo(false);
+    }
+  };
+
+  const handleUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    if (!file.type.includes('video/mp4') && !file.type.includes('video')) {
+      setError('Please upload a valid video file (MP4)');
+      return;
+    }
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+
+    await loadVideoFile(file, 'upload');
+  };
+
+  const handleDemoSelect = async (demo) => {
+    if (isProcessing || isLoadingVideo) return;
+
+    setIsLoadingVideo(true);
+    setError(null);
+    setActiveSource(demo.id);
+    setThumbnailUrl(null);
+    setMetadata(null);
+
+    try {
+      const response = await fetch(demo.src);
+      if (!response.ok) {
+        throw new Error(`Failed to load ${demo.fileName}`);
+      }
+      const blob = await response.blob();
+      const file = new File([blob], demo.fileName, { type: blob.type || 'video/mp4' });
+      await loadVideoFile(file, demo.id);
+    } catch (err) {
+      console.error('Error loading demo video:', err);
+      setError(err.message);
+      setVideoFile(null);
+      setActiveSource(null);
+      setIsLoadingVideo(false);
     }
   };
 
@@ -539,8 +551,9 @@ function Home() {
 
       setProgress(1);
       const totalTime = Math.floor((Date.now() - startTime) / 1000);
-      setProcessingStatus(`✓ Complete! Total time: ${totalTime}s. Ready to download.`);
-      console.log('Video processing and encoding complete! Ready to download.');
+      setElapsedTime(totalTime);
+      setProcessingStatus(`Complete! Total time: ${totalTime}s. Ready to download.`);
+      console.log(`Video processing and encoding complete in ${totalTime}s. Ready to download.`);
     } catch (err) {
       console.error('Error processing frames:', err);
       setError(err.message);
@@ -561,12 +574,27 @@ function Home() {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
+  const formatRenderDuration = (totalSeconds) => {
+    const seconds = Math.max(0, Math.floor(totalSeconds));
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    const unit = (value, label) => `${value} ${label}${value === 1 ? '' : 's'}`;
+    if (hours > 0) {
+      return `${unit(hours, 'hour')} ${unit(mins, 'minute')} ${unit(secs, 'second')}`;
+    }
+    if (mins > 0) {
+      return `${unit(mins, 'minute')} ${unit(secs, 'second')}`;
+    }
+    return unit(secs, 'second');
+  };
+
   return (
     <div className="home-container">
-      <h1 className="home-title">VideoV8</h1>
-      {videoFile && (
-        <div className="home-content">
-          <div className="upload-section">
+      {/* <h1 className="home-title">VideoV8</h1> */}
+      <div className="home-content">
+        <div className="source-cards">
+          <div className={`source-card upload-section${activeSource === 'upload' ? ' demo-card-selected' : ''}`}>
             <input
               ref={fileInputRef}
               type="file"
@@ -577,49 +605,45 @@ function Home() {
             <button
               className="upload-button"
               onClick={() => fileInputRef.current?.click()}
+              disabled={isProcessing || isLoadingVideo}
             >
               Upload
             </button>
           </div>
-          <div className="divider"></div>
-          <div className="preview-section">
-            {thumbnailUrl && <img src={thumbnailUrl} alt="Video thumbnail" className="video-thumbnail" />}
-            <div className="preview-overlay">
-              <button
-                className="export-button"
-                onClick={handleExport}
-                disabled={isProcessing}
-              >
-                {isProcessing ? `Processing... ${Math.round(progress * 100)}%` : 'Export'}
-              </button>
+          {DEMO_VIDEOS.map((demo) => (
+            <DemoVideoCard
+              key={demo.id}
+              src={demo.src}
+              label={demo.label}
+              selected={activeSource === demo.id}
+              loading={isLoadingVideo && activeSource === demo.id}
+              disabled={isProcessing || isLoadingVideo}
+              onClick={() => handleDemoSelect(demo)}
+            />
+          ))}
+        </div>
+        <div className="divider"></div>
+        <div className="preview-section">
+          {videoFile && thumbnailUrl ? (
+            <>
+              <img src={thumbnailUrl} alt="Video thumbnail" className="video-thumbnail" />
+              <div className="preview-overlay">
+                <button
+                  className="export-button"
+                  onClick={handleExport}
+                  disabled={isProcessing || isLoadingVideo}
+                >
+                  {isProcessing ? `Processing... ${Math.round(progress * 100)}%` : 'Export'}
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="preview-placeholder">
+              {isLoadingVideo ? 'Loading video…' : 'Select a video to preview'}
             </div>
-          </div>
+          )}
         </div>
-      )}
-
-      {!videoFile && (
-        <div className="home-content">
-          <div className="upload-section">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="video/mp4,video/*"
-              onChange={handleUpload}
-              style={{ display: 'none' }}
-            />
-            <button
-              className="upload-button"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              Upload
-            </button>
-          </div>
-          <div className="divider"></div>
-          <div className="preview-section">
-            {!videoFile && <div className="preview-placeholder">Select a video to preview</div>}
-          </div>
-        </div>
-      )}
+      </div>
 
       {videoFile && metadata && (
         <div className="video-info-section">
@@ -638,15 +662,10 @@ function Home() {
               />
               <span className="toggle-slider"></span>
               <span className="toggle-text">
-                {useMultithreaded ? '⚡ Multithreaded' : '⚙️ Single-threaded'}
+                {useMultithreaded ? 'Multithreaded' : 'Single-threaded'}
               </span>
             </label>
-            <div className="toggle-info">
-              {useMultithreaded 
-                ? `Parallel processing with ${WORKER_COUNT} workers (faster rendering)`
-                : 'Single-threaded streaming mode'
-              }
-            </div>
+
           </div>
           <div className="ai-effect-picker">
             <label className="ai-effect-label" htmlFor="ai-effect-select">AI effect</label>
@@ -660,11 +679,7 @@ function Home() {
               <option value={AI_EFFECT_FACEMESH}>FaceMesh coolers</option>
               <option value={AI_EFFECT_SEGMENTATION}>Pattern fill (segmentation)</option>
             </select>
-            <p className="ai-effect-hint">
-              {aiEffect === AI_EFFECT_SEGMENTATION
-                ? 'Fills the character shape with a random image from src/Patterns every 0.5s.'
-                : 'FaceMesh detects landmarks and draws sunglasses on the face.'}
-            </p>
+
           </div>
           {error && <div className="error-message">{error}</div>}
         </div>
@@ -767,6 +782,10 @@ function Home() {
       {downloadUrl && downloadFileName && (
         <div className="download-section">
           <h3>✓ Video Rendering Complete!</h3>
+          <p className="render-duration">
+            Rendering finished in <strong>{formatRenderDuration(elapsedTime)}</strong>
+            <span className="render-duration-clock"> ({formatTime(elapsedTime)})</span>
+          </p>
           <p>Your rendered video is ready to download.</p>
           <a
             href={downloadUrl}

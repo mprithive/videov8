@@ -1,0 +1,32 @@
+{
+    "name": "videov8",
+    "version": "0.1.0",
+    "description": "Browser video processing with optional MediaPipe inference and a per-frame draw callback.",
+    "type": "module",
+    "main": "./src/index.js",
+    "module": "./src/index.js",
+    "exports": {
+      ".": "./src/index.js"
+    },
+    "files": [
+      "src"
+    ],
+    "sideEffects": [
+      "./src/worker.js"
+    ],
+    "scripts": {
+      "build": "node -e \"console.log('videov8 publishes its source; nothing to compile')\"",
+      "prepublishOnly": "npm pack --dry-run"
+    },
+    "dependencies": {
+      "@mediapipe/tasks-vision": "^0.10.35",
+      "mediabunny": "^1.48.0"
+    },
+    "keywords": [
+      "video",
+      "mediapipe",
+      "web-worker",
+      "canvas"
+    ],
+    "license": "MIT"
+}
