@@ -260,18 +260,21 @@ Result: Max memory at any point = 70MB (current batch) + encoded frame
 
 ## 6. Current Implementation
 
-> **Updated 2026-08-25.** The core memory principle (encode-as-available, no
-> unbounded accumulation) still holds, but the pipeline has evolved
-> significantly. The historical attempts above remain for context; this section
-> reflects the code as it stands now. See `src/lib/MULTITHREADED_ARCHITECTURE.md`
-> for the full architecture write-up.
+> **Updated 2026-09-11.** The core memory principle (encode-as-available, no
+> unbounded accumulation) still holds. Later additions (AI-effect dropdown,
+> pattern fill, BTS viewer) do not change the memory model. See
+> `src/lib/MULTITHREADED_ARCHITECTURE.md` for the full architecture write-up.
 
 ### Files
 
 - **`src/lib/videoV8_multithreaded.js`** — orchestrator (main thread).
-- **`src/lib/faceWorker.js`** — real ES-module Web Worker (replaced the old
-  inline `WORKER_CODE` string). Runs `@mediapipe/tasks-vision` `FaceLandmarker`
-  and composites the effect.
+- **`src/lib/faceWorker.js`** — ES-module Web Worker. Loads **one** of
+  `FaceLandmarker` (sunglasses) or selfie `ImageSegmenter` (pattern fill),
+  then composites on an `OffscreenCanvas`.
+- **`src/lib/segmentationEffect.js`** — shared pattern-fill compositor;
+  loads `src/Patterns/1.png`–`3.png` and picks a synced image every 0.5s.
+- **`src/lib/videoV8.js`** — single-thread stream: one frame decode → AI →
+  encode → `sample.close()`. Peak ≈ one canvas + one sample.
 
 ### Method: `processAndEncodeFramesWithWorkers()`
 
@@ -285,11 +288,11 @@ Result: Max memory at any point = 70MB (current batch) + encoded frame
 
 ### Two pipelines (selected by `renderStride`)
 
-- **`renderStride === 1` (default): draw-in-worker.** Each worker receives the
-  full-res frame as a transferred `ImageBitmap`, downscales it to 512px for
-  inference, runs `FaceLandmarker`, composites sunglasses + overlay on a full-res
-  `OffscreenCanvas`, and transfers a **finished `ImageBitmap`** back. The main
-  thread only decodes, blits the finished frame, and encodes.
+- **`renderStride === 1` (default), or any `segmentation` export: draw-in-worker.**
+  Each worker receives the full-res `ImageBitmap`, downscales (512px face /
+  256px seg), runs the selected model, composites (sunglasses **or** pattern
+  fill), and transfers a **finished `ImageBitmap`** back. The main thread only
+  decodes, blits, and encodes.
 - **`renderStride > 1`: legacy main-thread compositing.** Workers return
   landmark coordinates only; the main thread interpolates between keyframes and
   draws. Kept as a quality/speed fallback.
@@ -325,10 +328,22 @@ RAM-budgeted buffering scheme (the goal is to keep workers saturated):
 - Frame handoffs use **transferable `ImageBitmap`s** (zero-copy), not copied
   `ImageData`/`ArrayBuffer`s.
 
+### Hardware hints (not exact)
+
+- `navigator.hardwareConcurrency` → logical cores, capped at 8; fallback **4**.
+- `navigator.deviceMemory` → Chrome/Edge bucket **≤ 8 GB**; missing → **8**.
+  A 32 GB machine is still treated as 8 GB for the chunk budget. These APIs
+  are privacy-rounded; the 320-frame cap exists because they are guesses.
+
 ### UI Integration: `src/components/home.js`
-- Timer updates live; elapsed seconds computed fresh in `onProgress` (avoids the
-  stale-closure bug from Attempt 6).
+- **AI effect** dropdown: FaceMesh coolers vs Pattern fill (segmentation).
+  Only the selected model is loaded.
+- Timer updates live; elapsed seconds computed fresh in `onProgress`.
 - Progress is a two-phase bar: decode fills 0→50%, encode fills 50→100%.
+- **View BTS** toggle hides that bar and shows Decoder → (Workers **or** a
+  static “AI Inference” block) → Encoder. Worker tiles glow until their
+  frames hit the encoder. Events come from `onPipelineEvent` (rAF-throttled).
+  Single-thread BTS has **no** worker tiles.
 
 ---
 
@@ -339,6 +354,8 @@ RAM-budgeted buffering scheme (the goal is to keep workers saturated):
 - ✅ **Progressive/overlapped encoding** — decode(N+1) overlaps process(N).
 - ✅ **Memory-aware buffering** — chunk size derived from device RAM budget.
 - ✅ **Single-decode pipeline** — sequential `samples()` iterator.
+- ✅ **Selectable AI effects** — FaceLandmarker or ImageSegmenter + pattern fill.
+- ✅ **BTS workflow viewer** — live decoder / worker / encoder events.
 
 ### Still open
 1. **Encode throughput** — encode is now the bottleneck (main-thread, serial,

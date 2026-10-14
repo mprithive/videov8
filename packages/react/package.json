@@ -1,0 +1,21 @@
+{
+  "name": "videov8-react",
+  "version": "0.1.0",
+  "description": "React hooks for videov8.",
+  "type": "module",
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "dependencies": {
+    "videov8": "0.1.0"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "license": "MIT"
+}

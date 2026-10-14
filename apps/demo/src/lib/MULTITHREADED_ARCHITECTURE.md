@@ -3,15 +3,16 @@
 ## Overview
 
 `VideoV8Multithreaded` (`src/lib/videoV8_multithreaded.js`) processes a video
-entirely in the browser: it decodes each frame, runs AI face tracking, draws an
-effect (sunglasses + overlay), and re-encodes to MP4.
+entirely in the browser: it decodes each frame, runs one selected AI effect,
+composites the result, and re-encodes to MP4.
 
 The design is shaped by one hard constraint:
 
 - **MediaBunny decode/encode must run on the main thread** (its WASM/WebCodecs
   pipeline is not used from workers here).
-- **MediaPipe `FaceLandmarker` runs great inside Web Workers** (pure WASM, no
-  DOM), and it — plus the per-frame drawing — is the parallelizable work.
+- **MediaPipe tasks (`FaceLandmarker` or `ImageSegmenter`) run inside Web
+  Workers** (pure WASM, no DOM), and that — plus the per-frame drawing — is the
+  parallelizable work.
 
 So the pipeline is **decode on main → infer + draw in parallel workers → encode
 on main, in order**. The main thread owns ordering and I/O; workers are the
@@ -21,8 +22,10 @@ compute pool.
 
 | File | Role |
 |------|------|
-| `videoV8_multithreaded.js` | Orchestrator (main thread): decode, dispatch, encode, memory/pipeline management |
-| `faceWorker.js` | Web Worker: MediaPipe inference + full-frame compositing, one per pool slot |
+| `videoV8_multithreaded.js` | Orchestrator (main thread): decode, dispatch, encode, memory/pipeline events |
+| `faceWorker.js` | Web Worker: loads **one** MediaPipe task + composites the chosen effect |
+| `segmentationEffect.js` | Shared pattern-fill compositor + pattern image loader (worker + main thread) |
+| `videoV8.js` | Single-thread streaming path (one frame at a time; no workers) |
 | `MULTITHREADED_ARCHITECTURE.md` | This document |
 
 Configuration lives in `src/components/home.js`:
@@ -35,13 +38,43 @@ const MEMORY_BUDGET_FRACTION = 0.4;        // fraction of RAM used for buffering
 const RENDER_FRAME_STRIDE = 1;             // 1 = render every frame (see below)
 ```
 
+`hardwareConcurrency` is the logical CPU count (capped at 8; fallback 4 if
+missing). `deviceMemory` is a **bucketed hint** (0.25–8 GB, Chrome/Edge only;
+fallback 8). Neither is exact hardware — the chunk cap (≤320) exists because
+these APIs are approximate.
+
+### AI effects (UI dropdown)
+
+The home page **AI effect** dropdown selects which model each worker loads.
+Only one effect runs per export — FaceMesh is unchanged when the other is
+selected.
+
+| `aiEffect` | Model | What is drawn |
+|------------|--------|----------------|
+| `facemesh` (default) | `FaceLandmarker` | Sunglasses + overlay on landmarks |
+| `segmentation` | Selfie `ImageSegmenter` | Pattern image clipped to the character mask |
+
+Passed through `INIT` / `PROCESS_BATCH` so workers never load both models.
+
+**Pattern fill** (`src/lib/segmentationEffect.js` + `src/Patterns/1.png`–`3.png`):
+
+- Segmentation at 256px; compositing at full resolution.
+- A cover-fitted pattern fills the masked character region.
+- Image changes every **0.5s** (`PATTERN_HOLD_MS`). The pick is
+  **timestamp-seeded** so every worker shows the same pattern in the same slot
+  (no flicker).
+- Mask polarity is left as-is to match the current segmenter output.
+
 ## Two pipelines
 
 The orchestrator chooses a pipeline based on `renderStride`:
 
 ```javascript
-const DRAW_IN_WORKER = renderStride === 1;
+const DRAW_IN_WORKER = renderStride === 1 || this.aiEffect === 'segmentation';
 ```
+
+Segmentation always uses draw-in-worker (masks must be applied where inference
+runs; transferring full-res masks back would be expensive).
 
 ### 1. Draw-in-worker pipeline — `renderStride === 1` (current default)
 
@@ -55,10 +88,10 @@ MAIN THREAD                                WORKER POOL (N workers)
 ───────────────────────────────────       ─────────────────────────────────────
 sink.samples() iterator (sequential,       ┌─ Worker k
   each packet decoded once)                │  - receive full-res ImageBitmap
-      │  full-res ImageBitmap  ───────────►│  - downscale to 512px for inference
-      │  (transferred, zero-copy)          │  - FaceLandmarker.detectForVideo()
-      │                                     │  - draw sunglasses + overlay on
-encode in frame order (MediaBunny) ◄───────┤    a full-res OffscreenCanvas
+      │  full-res ImageBitmap  ───────────►│  - downscale (512px face / 256px seg)
+      │  (transferred, zero-copy)          │  - FaceLandmarker **or** ImageSegmenter
+      │                                     │  - sunglasses **or** pattern fill
+encode in frame order (MediaBunny) ◄───────┤    on a full-res OffscreenCanvas
   drawImage(finishedBitmap) → add()        │  - transferToImageBitmap() back
       │                                     └─
 MP4 Blob
@@ -106,15 +139,18 @@ for inference, so the main thread creates **one** bitmap per frame.
 ### Worker pool
 
 `initializeWorkerPool()` spins up `WORKER_COUNT` module workers. Each loads
-`@mediapipe/tasks-vision` and creates a `FaceLandmarker`:
+`@mediapipe/tasks-vision` and creates **either** a `FaceLandmarker` **or** an
+`ImageSegmenter`, according to `aiEffect`:
 
 - **WASM served locally** from `public/mediapipe-wasm/` (no CDN).
 - **Delegate**: `CPU` when `WORKER_COUNT > 1`, `GPU` when single-worker. Multiple
   workers contending for one GPU queue serialize; CPU gives each worker its own
   core.
-- Model (~4 MB) is downloaded once and browser-cached. Init has a 90 s timeout;
-  a failed worker is skipped rather than blocking the pool.
-- `runningMode: 'VIDEO'`, `numFaces: 1`.
+- Models are downloaded once and browser-cached (FaceLandmarker ~4 MB; selfie
+  landscape segmenter is smaller). Init has a 90 s timeout; a failed worker is
+  skipped rather than blocking the pool.
+- `runningMode: 'VIDEO'`. Face mode: `numFaces: 1`. Seg mode: category mask
+  only (`outputCategoryMask: true`).
 
 ### Work-stealing batch pump
 
@@ -139,13 +175,14 @@ ownership handoff). Workers return finished `ImageBitmap`s, also transferred.
 
 ### Inside the worker (per frame)
 
-1. Downscale the received full-res bitmap onto a 512px detect canvas.
-2. Run `FaceLandmarker.detectForVideo()` — but only every `inferenceStride`
-   frames; otherwise reuse the last landmarks (`cachedLandmarks`). Because
-   normalised landmarks (0–1) are resolution-independent, tracking on a small
-   frame is accurate and much cheaper.
-3. Composite on a full-res `OffscreenCanvas`: draw the frame, then
-   `drawSunglasses()` (or a "No Face" overlay), then a frame-number overlay.
+1. Downscale the received full-res bitmap onto the detect canvas (512px for
+   FaceMesh, 256px for segmentation).
+2. Run inference only every `inferenceStride` frames; otherwise reuse
+   `cachedLandmarks` or `cachedCategoryMask`.
+3. Composite on a full-res `OffscreenCanvas`:
+   - **facemesh:** original frame + `drawSunglasses()` (or "No Face").
+   - **segmentation:** `applyPatternFill()` — original frame, mask cutout,
+     cover-fitted pattern from `src/Patterns/` for the current 0.5s slot.
 4. `transferToImageBitmap()` and hand it back to the main thread.
 
 `WORKER_BATCH_SIZE` is kept `>= inferenceStride` so each batch usually contains
@@ -217,12 +254,12 @@ bounded.
 |-----------|---------|-----------|
 | main → worker | full-res `ImageBitmap` (per frame) | transferable (zero-copy) |
 | worker → main | finished full-res `ImageBitmap` | transferable (zero-copy) |
-| main → worker (init) | width, height, wasmBasePath, delegate | structured clone |
+| main → worker (init) | width, height, wasmBasePath, delegate, **aiEffect** | structured clone |
 
 No `ImageData`/`ArrayBuffer` pixel buffers are copied between threads; all frame
 handoffs are `ImageBitmap` transfers.
 
-## Progress reporting
+## Progress reporting & BTS dashboard
 
 Progress counts **two units per frame** — decode fills 0→50%, encode fills
 50→100% — so the bar advances monotonically through both phases and never goes
@@ -231,6 +268,27 @@ backward:
 ```
 progress = (totalDecoded + nextFrameToEncode) / (totalFrames * 2)
 ```
+
+During export, **View BTS** on the home page hides that bar and shows a live
+workflow. The orchestrator emits `onPipelineEvent` (throttled in the UI with
+`requestAnimationFrame`):
+
+| Event | When |
+|-------|------|
+| `pipeline-ready` | Worker pool finished init |
+| `decoder-start` / `decoder-idle` | A decode chunk begins / ends |
+| `worker-receive` | A worker takes a batch |
+| `worker-processed` | That batch comes back |
+| `encoder-start` / `encoder-frame` / `encoder-idle` | Encode drain |
+
+- **Multithreaded:** Decoder → Worker 1…N → Encoder. A worker block **glows**
+  from receive until its frames are encoded (`pending` hits 0).
+- **Single-threaded:** Decoder → static **AI Inference** block → Encoder.
+  No worker tiles (nothing is spawned). Decoder/encoder still glow from
+  synthetic progress events. FaceMesh or pattern fill still run on the main
+  thread via `videoV8.js`.
+
+Toggle BTS off to restore the progress bar. Events keep flowing either way.
 
 ## Frame-rate reduction levers
 
@@ -241,8 +299,8 @@ Three independent knobs reduce AI/compute cost and compound:
    pipeline.
 2. **`inferenceStride`** — derived from `TARGET_AI_INFERENCE_FRAMES`; run true
    inference on a subset of processed frames and reuse cached landmarks between.
-3. **512px detection** — inference runs on a downscaled frame; landmarks are
-   normalised so accuracy is preserved while cost drops ~9× vs. 1080p.
+3. **Low-res detection** — FaceMesh infers at 512px; segmentation at 256px.
+   Landmarks/masks upscale; cost drops vs. full 4K inference.
 
 ## Error handling
 
@@ -264,7 +322,17 @@ not more worker parallelism.
 
 ## Browser support
 
-- Web Workers (module workers): all modern browsers.
+Chromium-first. Current Firefox and Safari 16.4+ should work; older Safari
+does not (no `OffscreenCanvas` / weak WebCodecs).
+
+- Web Workers (module workers): Chrome 80+, Firefox 114+, Safari 15.2+.
 - `OffscreenCanvas`: Chrome 69+, Firefox 105+, Safari 16.4+.
 - Transferable `ImageBitmap`: all modern browsers.
-- MediaBunny: see library documentation.
+- WebCodecs (MediaBunny decode/encode): Chrome/Edge strong; Firefox recent;
+  Safari 16.4+.
+- `navigator.deviceMemory`: Chrome/Edge only (fallback 8 GB).
+- MediaPipe WASM: best on Chromium; 4K + workers can be heavier on Safari.
+
+IE / old Android WebViews are unsupported. Single-thread is slightly more
+compatible (no worker `OffscreenCanvas`) but still needs MediaBunny/WebCodecs
+to encode.

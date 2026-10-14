@@ -134,6 +134,7 @@ class VideoV8 {
 
 	/**
 	 * Process video frames with a custom renderer function
+	 * @deprecated Use processAndEncodeFramesStreaming. This keeps every frame in memory.
 	 * @param {Function} renderFunction - Function(ctx, frameIndex, time) that processes each frame
 	 * @param {Object} options - Processing options
 	 * @returns {Promise<Array>} Array of processed canvas elements
@@ -214,6 +215,7 @@ class VideoV8 {
 
 	/**
 	 * Preview processed frame
+	 * @deprecated Unused. Remove in the next version.
 	 * @param {Function} renderFunction - Function to process the frame
 	 * @param {number} time - Time in seconds to preview
 	 * @returns {Promise<HTMLCanvasElement>} Processed canvas
@@ -261,6 +263,7 @@ class VideoV8 {
 
 	/**
 	 * Encode processed frames using MediaBunny
+	 * @deprecated Use processAndEncodeFramesStreaming. This keeps every frame in memory.
 	 * @param {Array} processedFrames - Array of processed frame objects
 	 * @param {Object} options - Encoding options
 	 * @returns {Promise<Blob>} Video file blob
