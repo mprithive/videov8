@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>videov8 core example</title>
+  </head>
+  <body>
+    <main>
+      <h1>videov8</h1>
+      <p class="lede">Core example. Pick a clip from <code>apps/videos</code> and an effect that uses <code>apps/patterns</code>.</p>
+
+      <form id="form">
+        <label>
+          Video
+          <select id="sample"></select>
+        </label>
+        <label id="file-label" class="is-hidden">
+          File
+          <input id="file" type="file" accept="video/*" />
+        </label>
+        <label>
+          Effect
+          <select id="effect">
+            <option value="coolers" selected>coolers</option>
+            <option value="pattern">pattern</option>
+            <option value="none">none</option>
+          </select>
+        </label>
+        <label>
+          Workers
+          <select id="workers">
+            <option value="1">1 (main thread)</option>
+            <option value="2" selected>2</option>
+            <option value="4">4</option>
+          </select>
+        </label>
+        <button id="run" type="submit">Run</button>
+      </form>
+
+      <p id="status">Choose a video and run.</p>
+      <progress id="progress" value="0" max="1"></progress>
+      <p class="caption">Source</p>
+      <video id="source" controls playsinline></video>
+      <p class="caption">Result</p>
+      <video id="result" controls playsinline></video>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
