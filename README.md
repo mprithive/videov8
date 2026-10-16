@@ -1,4 +1,4 @@
-# videov8
+# VideoV8
 
 Browser video processing. Decode a video, optionally run a MediaPipe model, draw on each frame, and encode an MP4.
 
