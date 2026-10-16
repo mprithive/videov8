@@ -79,7 +79,9 @@ function createInferenceWorker() {
 			detectCtx = new OffscreenCanvas(detectWidth, detectHeight).getContext('2d', { willReadFrequently: true });
 
 			try {
-				const resolver = await vision.FilesetResolver.forVisionTasks(wasmBasePath);
+				// This file is a module worker, so importScripts cannot install the
+				// classic wasm loader. The module build assigns globalThis.ModuleFactory.
+				const resolver = await vision.FilesetResolver.forVisionTasks(wasmBasePath, true);
 				model = await adapter.create(resolver, inference);
 			} catch (err) {
 				console.warn('[VideoV8 worker] model init failed, running without AI:', err && err.message);
@@ -348,7 +350,7 @@ async function spawnInferenceWorkers({ workerCount, inference, inferenceStride, 
 	const workers = [];
 	const ready = [];
 	for (let i = 0; i < workerCount; i++) {
-		const worker = new Worker(new URL('./worker.js', import.meta.url));
+		const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 		workers.push(worker);
 		ready.push(new Promise((resolve) => {
 			let timeout;

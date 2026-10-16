@@ -13,7 +13,7 @@
  *
  * Worker code lives in worker.js. The model registry shared by both
  * sides lives in shared.js. Webpack 5 bundles the worker from
- * `new Worker(new URL('./worker.js', import.meta.url))`.
+ * `new Worker(new URL('./worker.js', import.meta.url), { type: 'module' })`.
  *
  * ── Public API ──────────────────────────────────────────────────────────────
  *
@@ -355,7 +355,7 @@ class VideoV8 {
 		return new Promise((resolve, reject) => {
 			let coordinator;
 			try {
-				coordinator = new Worker(new URL('./worker.js', import.meta.url));
+				coordinator = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 			} catch (err) {
 				reject(err);
 				return;

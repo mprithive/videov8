@@ -1,0 +1,20 @@
+{
+  "name": "videov8-example-react",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "postinstall": "node ../../scripts/copy-mediapipe-wasm.js public/mediapipe-wasm",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "videov8-react": "0.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.4.1",
+    "vite": "^6.3.5"
+  }
+}

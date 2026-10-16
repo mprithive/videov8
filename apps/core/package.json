@@ -1,0 +1,17 @@
+{
+  "name": "videov8-example-core",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "postinstall": "node ../../scripts/copy-mediapipe-wasm.js public/mediapipe-wasm",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "videov8": "0.1.0"
+  },
+  "devDependencies": {
+    "vite": "^6.3.5"
+  }
+}

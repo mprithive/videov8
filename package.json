@@ -6,7 +6,9 @@
       "apps/*"
     ],
     "scripts": {
-      "start": "npm start -w videov8-demo",
+      "start": "npm run dev -w videov8-example-react",
+      "start:react": "npm run dev -w videov8-example-react",
+      "start:core": "npm run dev -w videov8-example-core",
       "build:lib": "npm run build -w videov8"
     }
   }
