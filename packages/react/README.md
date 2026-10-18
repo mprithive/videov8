@@ -1,23 +1,15 @@
-# VideoV8
+# VideoV8-React
 
 Browser video processing. Decode a video, optionally run a MediaPipe model, draw on each frame, and encode an MP4.
 
-`videov8` is the library. `videov8-react` is a set of React hooks around the same class.
+`videov8-react` is a set of React hooks around the same class.
 
 ## Install
-
-### Vanilla JavaScript
-
-```bash
-npm install videov8
-```
-
-### React
 
 Install the hooks and React 18 or newer. `videov8-react` depends on `videov8`.
 
 ```bash
-npm install videov8-react react react-dom
+npm install videov8-react
 ```
 
 ## Setup
@@ -152,7 +144,7 @@ On the worker path, `setup` and `draw` are rebuilt from `Function.prototype.toSt
 
 ```bash
 npm install
-npm run start:core    # http://localhost:5173
+
 npm start             # React example, http://localhost:5174
 ```
 
