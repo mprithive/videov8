@@ -1,6 +1,6 @@
 {
     "name": "videov8",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "Browser video processing with optional MediaPipe inference and a per-frame draw callback.",
     "type": "module",
     "main": "./src/index.js",

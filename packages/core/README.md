@@ -12,14 +12,6 @@ Browser video processing. Decode a video, optionally run a MediaPipe model, draw
 npm install videov8
 ```
 
-### React
-
-Install the hooks and React 18 or newer. `videov8-react` depends on `videov8`.
-
-```bash
-npm install videov8-react react react-dom
-```
-
 ## Setup
 
 Copy the MediaPipe wasm runtime into your app's public folder. The library loads it from `/mediapipe-wasm` by default.
