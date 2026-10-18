@@ -1,6 +1,6 @@
 {
   "name": "videov8-react",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "React hooks for videov8.",
   "type": "module",
   "main": "./src/index.js",
@@ -12,7 +12,7 @@
     "src"
   ],
   "dependencies": {
-    "videov8": "0.1.2"
+    "videov8": "0.1.3"
   },
   "peerDependencies": {
     "react": ">=18"

@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "videov8": "0.1.0"
+    "videov8": "0.1.3"
   },
   "devDependencies": {
     "vite": "^6.3.5"
